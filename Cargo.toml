@@ -2,11 +2,25 @@
 name = "ssh-agent-kit"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
+repository = "https://github.com/rustafariandev/ssh-agent-kit"
+documentation = "https://docs.rs/ssh-agent-kit"
 description = "A framework for building custom SSH agents: the OpenSSH agent protocol, with pluggable key backends, smartcard providers, policy and extensions"
 keywords = ["ssh", "ssh-agent", "agent", "framework"]
 categories = ["authentication", "cryptography", "network-programming"]
 readme = "README.md"
+include = [
+    "/src",
+    "/examples",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
+
+[package.metadata.docs.rs]
+features = ["dsa"]
 
 [features]
 default = []

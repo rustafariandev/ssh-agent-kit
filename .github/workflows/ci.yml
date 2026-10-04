@@ -36,3 +36,31 @@ jobs:
         run: cargo test --features dsa
         env:
           RUSTFLAGS: ""
+
+  msrv:
+    name: minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: "1.88"
+      - name: Check
+        run: cargo check --all-targets --features dsa,test-util
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - name: Package
+        run: cargo package --locked
+      - name: Docs
+        run: cargo doc --no-deps --features dsa
+        env:
+          RUSTDOCFLAGS: -D warnings
