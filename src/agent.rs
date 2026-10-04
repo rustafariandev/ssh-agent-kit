@@ -1,0 +1,1432 @@
+//! The agent itself: identity bookkeeping and request handling.
+
+use crate::backend::{Backend, Expiring, Lifecycle, SmartcardProvider};
+use crate::cert::{AssociatedCerts, CertKey};
+use crate::destination::{self, Connection, DestinationConstraint};
+use crate::extension::{Extension, ExtensionContext};
+use crate::keytype::{KeyDecoder, KeyRegistry};
+use crate::lock::{Locker, PassphraseLock};
+use crate::policy::{Confirm, ConfirmRequest, Policy, SignInfo};
+use crate::signer::{BoxError, SignerRef, VerifyError};
+use crate::wire::{self, Request};
+use ssh_encoding::Decode;
+use ssh_key::{HashAlg, PublicKey};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+use thiserror::Error;
+use zeroize::Zeroizing;
+
+/// Lock `mutex`, carrying on if a thread panicked while holding it: each
+/// value guarded here is left consistent between statements, so a poisoned
+/// lock still holds usable state.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+#[derive(Debug, Error)]
+pub enum AgentError {
+    /// A backend or a key could not sign or fetch; see
+    /// [`AgentError::backend`] to look inside.
+    #[error(transparent)]
+    Backend(BoxError),
+    #[error(transparent)]
+    Verify(#[from] VerifyError),
+    #[error("requested key is not served by this agent")]
+    UnknownKey,
+    #[error(
+        "client asked for an ssh-rsa (SHA-1) signature, which is not supported; it must request rsa-sha2-256 or rsa-sha2-512"
+    )]
+    Sha1Requested,
+    #[error(transparent)]
+    Wire(#[from] wire::WireError),
+    #[error("none of the certificates certifies the key")]
+    NoMatchingCertificate,
+    #[error("destination-constrained key refused on this connection")]
+    DestinationRefused,
+    #[error("the signature request could not be identified as an SSH userauth request")]
+    UnidentifiedSignature,
+    #[error("the user refused the use of the key")]
+    ConfirmRefused,
+    #[error("refused by the agent's policy")]
+    PolicyRefused,
+    #[error("this agent has no smartcard provider")]
+    NoSmartcardProvider,
+}
+
+impl AgentError {
+    /// The backend's own error, if this is one of type `E`.
+    pub fn backend<E: std::error::Error + 'static>(&self) -> Option<&E> {
+        match self {
+            AgentError::Backend(e) => e.downcast_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// Agent state shared between connections.
+///
+/// Build one with [`Agent::new`] and the `with_*` methods, then serve it with
+/// [`crate::serve`]. Keys come from three places:
+///
+/// - [`Backend`]s the agent's owner registers, such as a hardware token;
+/// - `ssh-add FILE`, decoded by the [`KeyDecoder`]s in its registry and held
+///   by the agent;
+/// - `ssh-add -s PROVIDER`, through the [`SmartcardProvider`].
+pub struct Agent {
+    backends: Vec<Arc<dyn Backend>>,
+    smartcard: Option<Arc<dyn SmartcardProvider>>,
+    /// Keys added at runtime with `ssh-add FILE`.
+    held: Mutex<Vec<Expiring<SignerRef>>>,
+    /// Certificates, each served as an identity of its own.
+    certs: Mutex<Vec<Expiring<CertIdentity>>>,
+    /// Protocol extension handlers, matched by name.
+    extensions: Mutex<Vec<Arc<dyn Extension>>>,
+    /// Key-type decoders for `ssh-add FILE`, matched by the request's key type.
+    key_types: Mutex<KeyRegistry>,
+    /// Asks the user about keys added with `ssh-add -c`; without one they
+    /// never sign.
+    confirm: Option<Arc<dyn Confirm>>,
+    policy: Option<Arc<dyn Policy>>,
+    lifecycle: Vec<Arc<dyn Lifecycle>>,
+    locker: Arc<dyn Locker>,
+    /// The `ssh-add -c`/`-h` constraints of added keys, by their public key
+    /// blob, shared with the certificates the key signs for. Entries are
+    /// replaced when the key is re-added, and cleared when it is removed
+    /// unless a certificate it signs for is still served.
+    meta: Mutex<HashMap<Vec<u8>, KeyMeta>>,
+    /// Lifetime applied to keys added without their own `ssh-add -t`, as
+    /// `ssh-agent -t` does; `None` keeps them until removed.
+    default_lifetime: Option<u32>,
+    /// Wrong unlock passphrases since the last good one, which slow down
+    /// each further failure (see [`Self::handle_unlock`]).
+    unlock_failures: Mutex<u32>,
+    /// Delay added per recorded failure.
+    unlock_backoff: Duration,
+}
+
+/// The constraints of an added key: `ssh-add -c` and `ssh-add -h`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct KeyMeta {
+    confirm: bool,
+    destination: Vec<DestinationConstraint>,
+}
+
+impl KeyMeta {
+    fn is_empty(&self) -> bool {
+        !self.confirm && self.destination.is_empty()
+    }
+}
+
+/// Delay per failed unlock, as in OpenSSH: 0.1 s more for each failure.
+const UNLOCK_BACKOFF: Duration = Duration::from_millis(100);
+/// Failures counted at most, so the delay tops out at 10 s.
+const MAX_UNLOCK_FAILURES: u32 = 100;
+
+/// A certificate the agent lists, and the key that signs for it.
+#[derive(Clone)]
+struct CertIdentity {
+    cert: CertKey,
+    comment: String,
+    signer: CertSigner,
+}
+
+#[derive(Clone)]
+enum CertSigner {
+    /// The private key `ssh-add FILE` sent with the certificate.
+    Held(SignerRef),
+    /// The key `ssh-add -s PROVIDER CERT…` named; dropped with it.
+    Provider(SignerRef),
+    /// Whichever key a backend serves that the certificate certifies, for a
+    /// certificate loaded with [`Agent::with_certificates`].
+    Served,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Agent {
+    /// An agent with no keys yet: it serves what `ssh-add FILE` adds, in the
+    /// built-in key types, until backends and the rest are registered.
+    pub fn new() -> Self {
+        Agent {
+            backends: Vec::new(),
+            smartcard: None,
+            held: Mutex::new(Vec::new()),
+            certs: Mutex::new(Vec::new()),
+            extensions: Mutex::new(Vec::new()),
+            key_types: Mutex::new(KeyRegistry::builtin()),
+            confirm: None,
+            policy: None,
+            lifecycle: Vec::new(),
+            locker: Arc::new(PassphraseLock::default()),
+            meta: Mutex::new(HashMap::new()),
+            default_lifetime: None,
+            unlock_failures: Mutex::new(0),
+            unlock_backoff: UNLOCK_BACKOFF,
+        }
+    }
+
+    /// Serve the identities of `backend`, listed before any added with
+    /// `ssh-add FILE`, in registration order.
+    pub fn with_backend(mut self, backend: Arc<dyn Backend>) -> Self {
+        self.backends.push(backend);
+        self
+    }
+
+    /// Answer `ssh-add -s`/`-e` with `provider`. Without one they fail.
+    pub fn with_smartcard(mut self, provider: Arc<dyn SmartcardProvider>) -> Self {
+        self.smartcard = Some(provider);
+        self
+    }
+
+    /// Ask the user through `confirm` before each use of a key added with
+    /// `ssh-add -c`.
+    pub fn with_confirm(mut self, confirm: Arc<dyn Confirm>) -> Self {
+        self.confirm = Some(confirm);
+        self
+    }
+
+    /// Check every signature and key change against `policy`.
+    pub fn with_policy(mut self, policy: Arc<dyn Policy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Tell `hook` when the agent is locked, unlocked or cleared.
+    pub fn with_lifecycle(mut self, hook: Arc<dyn Lifecycle>) -> Self {
+        self.lifecycle.push(hook);
+        self
+    }
+
+    /// Keep the `ssh-add -x` lock with `locker` instead of a passphrase hash.
+    pub fn with_locker(mut self, locker: Arc<dyn Locker>) -> Self {
+        self.locker = locker;
+        self
+    }
+
+    /// Give keys added without an `ssh-add -t` constraint a lifetime of
+    /// `seconds`, as `ssh-agent -t` does. Zero or `None` means no default.
+    pub fn with_default_lifetime(mut self, seconds: Option<u32>) -> Self {
+        self.default_lifetime = seconds.filter(|secs| *secs > 0);
+        self
+    }
+
+    /// Wait `backoff` longer after each wrong unlock passphrase (0.1 s by
+    /// default, as in OpenSSH), up to 100 times that.
+    pub fn with_unlock_backoff(mut self, backoff: Duration) -> Self {
+        self.unlock_backoff = backoff;
+        self
+    }
+
+    /// Register a protocol extension handler and return the agent, for the
+    /// builder style of [`Self::new`]. A later registration under the same
+    /// name wins.
+    pub fn with_extension(self, extension: impl Extension + 'static) -> Self {
+        self.register_extension(extension);
+        self
+    }
+
+    /// Register a protocol extension handler, answering
+    /// `SSH_AGENTC_EXTENSION` requests whose name it matches. A later
+    /// registration under the same name wins.
+    pub fn register_extension(&self, extension: impl Extension + 'static) {
+        let name = extension.name().to_owned();
+        let mut extensions = lock(&self.extensions);
+        extensions.retain(|e| e.name() != name);
+        extensions.push(Arc::new(extension));
+    }
+
+    /// Register a key-type decoder for `ssh-add FILE` and return the agent,
+    /// for the builder style of [`Self::new`]. A later registration under a
+    /// name wins, so a built-in key type can be replaced as well as extended.
+    pub fn with_key_type(self, decoder: impl KeyDecoder + 'static) -> Self {
+        self.register_key_type(decoder);
+        self
+    }
+
+    /// Register a key-type decoder, consulted for `SSH2_AGENTC_ADD_IDENTITY`
+    /// requests whose key type it answers. A later registration under a name
+    /// wins.
+    pub fn register_key_type(&self, decoder: impl KeyDecoder + 'static) {
+        lock(&self.key_types).register(decoder);
+    }
+
+    /// The lifetime keys get without their own `ssh-add -t`.
+    pub fn default_lifetime(&self) -> Option<u32> {
+        self.default_lifetime
+    }
+
+    /// Serve a key added with `ssh-add FILE`, with an optional lifetime from
+    /// `ssh-add -t`. A key already served is replaced, so a fresh lifetime
+    /// takes effect.
+    pub fn add_key(&self, key: SignerRef, lifetime: Option<u32>) {
+        self.purge_expired();
+        let blob = key.key_blob();
+        let comment = key.comment().to_owned();
+        let mut held = lock(&self.held);
+        held.retain(|e| e.item.key_blob() != blob);
+        held.push(Expiring::new(key, lifetime));
+        drop(held);
+        tracing::info!(comment, "serving added key");
+    }
+
+    /// Serve certificates for backend keys. Each is listed, under its file's
+    /// comment (else its key id), while a backend serves a key it certifies
+    /// and it has not expired.
+    pub fn with_certificates(self, certs: impl IntoIterator<Item = CertKey>) -> Self {
+        lock(&self.certs).extend(certs.into_iter().map(|cert| {
+            let comment = match cert.comment() {
+                "" => cert.certificate().key_id().to_owned(),
+                comment => comment.to_owned(),
+            };
+            Expiring::new(
+                CertIdentity {
+                    cert,
+                    comment,
+                    signer: CertSigner::Served,
+                },
+                None,
+            )
+        }));
+        self
+    }
+
+    /// Serve the certificate `ssh-add FILE` sent with its private key, with
+    /// an optional lifetime from `ssh-add -t` (which ssh-add sets to the
+    /// certificate's expiry on its own). The certificate is listed under the
+    /// key's comment, and a certificate already served is replaced.
+    pub fn add_cert_key(&self, key: SignerRef, cert: CertKey, lifetime: Option<u32>) {
+        let comment = key.comment().to_owned();
+        tracing::info!(
+            comment,
+            key_id = cert.certificate().key_id(),
+            "serving added certificate"
+        );
+        self.push_cert(
+            CertIdentity {
+                cert,
+                comment,
+                signer: CertSigner::Held(key),
+            },
+            lifetime,
+        );
+    }
+
+    fn push_cert(&self, identity: CertIdentity, lifetime: Option<u32>) {
+        self.purge_expired();
+        let mut certs = lock(&self.certs);
+        certs.retain(|e| e.item.cert.blob() != identity.cert.blob());
+        certs.push(Expiring::new(identity, lifetime));
+    }
+
+    /// Stop serving the certificate whose blob is `blob`. Returns whether
+    /// anything was removed.
+    pub fn remove_cert(&self, blob: &[u8]) -> bool {
+        self.take_cert(blob).is_some()
+    }
+
+    /// Stop serving the certificate whose blob is `blob`, and return it.
+    fn take_cert(&self, blob: &[u8]) -> Option<CertIdentity> {
+        let mut certs = lock(&self.certs);
+        let at = certs.iter().position(|e| e.item.cert.blob() == blob)?;
+        Some(certs.remove(at).item)
+    }
+
+    /// Stop serving the certificates `ssh-add -s` attached to the key
+    /// `key_blob`. Returns whether any were.
+    fn remove_provider_certs(&self, key_blob: &[u8]) -> bool {
+        let mut certs = lock(&self.certs);
+        let before = certs.len();
+        certs.retain(
+            |e| !matches!(&e.item.signer, CertSigner::Provider(key) if key.key_blob() == key_blob),
+        );
+        certs.len() != before
+    }
+
+    /// Forget what the agent attached to a backend key that its backend
+    /// stopped serving on its own: the certificates `ssh-add -s` attached to
+    /// it and, once something was removed (`served` says whether the key
+    /// itself was), its `ssh-add -c`/`-h` constraints. Returns whether any
+    /// certificate was dropped.
+    pub fn release(&self, key_blob: &[u8], served: bool) -> bool {
+        let dropped = self.remove_provider_certs(key_blob);
+        if served || dropped {
+            lock(&self.meta).remove(key_blob);
+        }
+        dropped
+    }
+
+    /// Stop serving the key added with `ssh-add FILE` whose public key blob is
+    /// `key_blob`. Returns whether anything was removed.
+    pub fn remove_key(&self, key_blob: &[u8]) -> bool {
+        let mut held = lock(&self.held);
+        let before = held.len();
+        held.retain(|e| e.item.key_blob() != key_blob);
+        held.len() != before
+    }
+
+    /// Whether `ssh-add -x` has locked the agent.
+    pub fn is_locked(&self) -> bool {
+        self.locker.is_locked()
+    }
+
+    /// Lock with `passphrase`; fails if already locked, as in OpenSSH.
+    pub fn lock(&self, passphrase: &[u8]) -> bool {
+        let locked = self.locker.lock(passphrase);
+        if locked {
+            self.lifecycle.iter().for_each(|hook| hook.locked());
+        }
+        locked
+    }
+
+    /// Unlock if `passphrase` is the one the agent was locked with.
+    pub fn unlock(&self, passphrase: &[u8]) -> bool {
+        let unlocked = self.locker.unlock(passphrase);
+        if unlocked {
+            self.lifecycle.iter().for_each(|hook| hook.unlocked());
+        }
+        unlocked
+    }
+
+    /// Drop identities whose lifetime has elapsed, in the backends too.
+    pub fn purge_expired(&self) {
+        for backend in &self.backends {
+            backend.purge_expired();
+        }
+        lock(&self.held).retain(|e| !e.expired());
+        lock(&self.certs).retain(|e| !e.expired());
+    }
+
+    /// Public keys for every identity: each backend's, fetched as needed,
+    /// then those added with `ssh-add FILE`.
+    pub fn public_keys(&self) -> Vec<PublicKey> {
+        self.purge_expired();
+        let mut keys: Vec<PublicKey> = self
+            .backends
+            .iter()
+            .flat_map(|b| b.identities())
+            .map(|key| key.public_key().clone())
+            .collect();
+        keys.extend(lock(&self.held).iter().map(|e| e.item.public_key().clone()));
+        keys
+    }
+
+    /// Every identity the agent lists: the public keys of [`Self::public_keys`]
+    /// followed by the certificates whose key is served. A certificate past
+    /// its validity is left out.
+    pub fn identities(&self) -> Vec<wire::Listed> {
+        self.identities_for(&Connection::default())
+    }
+
+    /// The identities listed on this connection. A destination-constrained
+    /// key is left out when the connection's session bindings do not permit
+    /// it, as OpenSSH's agent does.
+    pub fn identities_for(&self, connection: &Connection) -> Vec<wire::Listed> {
+        let mut out = Vec::new();
+        for key in self.public_keys() {
+            if let Ok(blob) = key.to_bytes()
+                && self.blob_permitted(&blob, connection)
+            {
+                out.push(wire::listed(&key));
+            }
+        }
+        let certs: Vec<CertIdentity> = lock(&self.certs).iter().map(|e| e.item.clone()).collect();
+        for identity in certs {
+            if identity.cert.expired() {
+                tracing::debug!(
+                    key_id = identity.cert.certificate().key_id(),
+                    "certificate has expired; not listed"
+                );
+                continue;
+            }
+            if let Some(signer) = self.cert_signer(&identity)
+                && self.blob_permitted(&signer.key_blob(), connection)
+            {
+                out.push((identity.cert.blob().to_vec(), identity.comment));
+            }
+        }
+        out
+    }
+
+    /// Whether the key with `blob` may be shown on this connection.
+    fn blob_permitted(&self, blob: &[u8], connection: &Connection) -> bool {
+        let meta = self.meta_for(blob);
+        meta.destination.is_empty() || connection.permits(&meta.destination, None)
+    }
+
+    /// Certificates served for `key`, a backend or added key.
+    pub fn certificates_for(&self, key: &PublicKey) -> Vec<CertKey> {
+        lock(&self.certs)
+            .iter()
+            .filter(|e| e.item.cert.certifies(key) && !e.item.cert.expired())
+            .map(|e| e.item.cert.clone())
+            .collect()
+    }
+
+    /// The key that signs for a certificate, if it is served.
+    fn cert_signer(&self, identity: &CertIdentity) -> Option<SignerRef> {
+        match &identity.signer {
+            CertSigner::Held(key) | CertSigner::Provider(key) => Some(key.clone()),
+            CertSigner::Served => self
+                .backends
+                .iter()
+                .flat_map(|b| b.known())
+                .find(|key| identity.cert.certifies(key.public_key())),
+        }
+    }
+
+    /// The backend key whose public key blob is `key_blob`, if it is known.
+    fn backend_key(&self, key_blob: &[u8]) -> Option<SignerRef> {
+        self.backends
+            .iter()
+            .flat_map(|b| b.known())
+            .find(|key| key.key_blob() == key_blob)
+    }
+
+    /// Handle one request body and produce the reply body.
+    ///
+    /// The lock is checked once: a locked agent lists no keys and serves
+    /// only unlock and protocol extensions.
+    ///
+    /// This entry point gives the request a fresh [`Connection`], so its
+    /// session bindings do not outlive it. A server should use
+    /// [`Self::handle_in`] with one [`Connection`] per client connection.
+    pub fn handle(&self, body: &[u8]) -> Vec<u8> {
+        self.handle_in(body, &mut Connection::default())
+    }
+
+    /// Handle one request body on `connection`, which keeps the session
+    /// bindings a client records with `session-bind@openssh.com` for the life
+    /// of its connection.
+    pub fn handle_in(&self, body: &[u8], connection: &mut Connection) -> Vec<u8> {
+        let request = {
+            let key_types = lock(&self.key_types);
+            wire::parse_request_with(&key_types, body)
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(e) => {
+                tracing::warn!(error = %e, "bad request");
+                return wire::failure();
+            }
+        };
+        if self.is_locked() {
+            self.handle_locked(request, connection)
+        } else {
+            self.handle_unlocked(request, connection)
+        }
+    }
+
+    /// Answer a request while `ssh-add -x` has locked the agent: no keys are
+    /// listed, unlock and protocol extensions are served, and everything
+    /// else is refused, including request types added later.
+    fn handle_locked(&self, request: Request, connection: &mut Connection) -> Vec<u8> {
+        match request {
+            Request::RequestIdentities => {
+                tracing::debug!("listing identities: agent is locked, none");
+                wire::identities_answer(&[])
+            }
+            Request::RequestRsaIdentities => {
+                tracing::debug!("SSH v1 identities request: answering with none");
+                wire::rsa_identities_answer()
+            }
+            Request::Unlock(passphrase) => self.handle_unlock(&passphrase),
+            Request::Extension { name, data } => self.handle_extension(&name, &data, connection),
+            Request::Unsupported(kind) => {
+                tracing::debug!(kind, "unsupported request");
+                wire::failure()
+            }
+            other => {
+                tracing::warn!(request = other.name(), "refused: agent is locked");
+                wire::failure()
+            }
+        }
+    }
+
+    /// Whether the policy lets this connection change keys.
+    fn manage_allowed(&self, connection: &Connection) -> bool {
+        let allowed = self
+            .policy
+            .as_ref()
+            .is_none_or(|p| p.allow_manage(connection));
+        if !allowed {
+            tracing::warn!("refused: the policy forbids key changes on this connection");
+        }
+        allowed
+    }
+
+    /// Answer a request while the agent is unlocked.
+    fn handle_unlocked(&self, request: Request, connection: &mut Connection) -> Vec<u8> {
+        match request {
+            Request::RequestIdentities => {
+                let identities = self.identities_for(connection);
+                tracing::debug!(count = identities.len(), "listing identities");
+                wire::identities_answer(&identities)
+            }
+            Request::RequestRsaIdentities => {
+                tracing::debug!("SSH v1 identities request: answering with none");
+                wire::rsa_identities_answer()
+            }
+            Request::Sign {
+                key_blob,
+                data,
+                flags,
+            } => {
+                tracing::debug!(len = data.len(), flags, "sign request");
+                match self.sign(&key_blob, &data, flags, connection) {
+                    Ok(reply) => reply,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sign request failed");
+                        wire::failure()
+                    }
+                }
+            }
+            Request::Lock(passphrase) => {
+                if self.lock(&passphrase) {
+                    tracing::info!("agent locked");
+                    wire::success()
+                } else {
+                    tracing::warn!("lock request refused: already locked");
+                    wire::failure()
+                }
+            }
+            Request::Unlock(passphrase) => self.handle_unlock(&passphrase),
+            _ if request.changes_keys() && !self.manage_allowed(connection) => wire::failure(),
+            Request::AddIdentity {
+                key,
+                cert,
+                lifetime,
+                confirm,
+                destination,
+            } => {
+                let blob = key.key_blob();
+                if !self.may_manage(&blob, connection) {
+                    tracing::warn!("refused: key not permitted on this connection");
+                    return wire::failure();
+                }
+                let lifetime = self.lifetime_for(lifetime);
+                let meta = KeyMeta {
+                    confirm,
+                    destination,
+                };
+                let _ = self.publish_constrained(blob, meta, || {
+                    match cert {
+                        Some(cert) => self.add_cert_key(key, *cert, lifetime),
+                        None => self.add_key(key, lifetime),
+                    }
+                    Ok(())
+                });
+                wire::success()
+            }
+            Request::RemoveIdentity { key_blob } => {
+                if !self.may_manage(&key_blob, connection) {
+                    tracing::warn!("refused: key not permitted on this connection");
+                    return wire::failure();
+                }
+                if self.remove_key(&key_blob) {
+                    self.forget_meta(&key_blob);
+                    tracing::info!("removed added key");
+                    wire::success()
+                } else if let Some(identity) = self.take_cert(&key_blob) {
+                    if let CertSigner::Held(key) = &identity.signer {
+                        self.forget_meta(&key.key_blob());
+                    }
+                    tracing::info!("removed certificate");
+                    wire::success()
+                } else if self.backend_key(&key_blob).is_some()
+                    && self.backends.iter().any(|b| b.remove(&key_blob))
+                {
+                    self.remove_provider_certs(&key_blob);
+                    lock(&self.meta).remove(&key_blob);
+                    tracing::info!("removed key");
+                    wire::success()
+                } else {
+                    tracing::debug!("no such key to remove");
+                    wire::failure()
+                }
+            }
+            Request::RemoveAllIdentities => {
+                self.remove_all();
+                tracing::info!("removed every identity");
+                wire::success()
+            }
+            // As OpenSSH refuses remote provider adds: a forwarded hop needs
+            // only a key's name to re-add it, which would drop its
+            // `ssh-add -c`/`-h` constraints.
+            Request::AddSmartcardKey { .. } | Request::RemoveSmartcardKey { .. }
+                if connection.bind_attempted() =>
+            {
+                tracing::warn!("refused: provider keys are managed only on a local connection");
+                wire::failure()
+            }
+            Request::AddSmartcardKey {
+                provider,
+                pin,
+                lifetime,
+                confirm,
+                destination,
+                certs,
+            } => {
+                let meta = KeyMeta {
+                    confirm,
+                    destination,
+                };
+                match self.add_smartcard(&provider, &pin, lifetime, meta, certs) {
+                    Ok(()) => wire::success(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot add provider key");
+                        wire::failure()
+                    }
+                }
+            }
+            Request::RemoveSmartcardKey { provider } => match self.remove_smartcard(&provider) {
+                Ok(true) => {
+                    tracing::info!("removed provider key");
+                    wire::success()
+                }
+                Ok(false) => {
+                    tracing::debug!("no such provider key to remove");
+                    wire::failure()
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot remove provider key");
+                    wire::failure()
+                }
+            },
+            Request::Extension { name, data } => self.handle_extension(&name, &data, connection),
+            Request::Unsupported(kind) => {
+                tracing::debug!(kind, "unsupported request");
+                wire::failure()
+            }
+        }
+    }
+
+    /// `ssh-add -s PROVIDER [CERT…]`: serve the key the provider names
+    /// (unless `ssh-add -C` asked for its certificates only) and the given
+    /// certificates that certify it; the others are skipped. Fails when only
+    /// certificates were asked for and none certifies the key.
+    fn add_smartcard(
+        &self,
+        provider: &[u8],
+        pin: &Zeroizing<Vec<u8>>,
+        lifetime: Option<u32>,
+        meta: KeyMeta,
+        certs: Option<AssociatedCerts>,
+    ) -> Result<(), AgentError> {
+        let source = self
+            .smartcard
+            .as_ref()
+            .ok_or(AgentError::NoSmartcardProvider)?;
+        let lifetime = self.lifetime_for(lifetime);
+        self.purge_expired();
+        // Fetch the key first: its blob names the constraints.
+        let key = source.resolve(provider, pin).map_err(AgentError::Backend)?;
+        self.publish_constrained(key.key_blob(), meta, || {
+            let certs_only = certs.as_ref().is_some_and(|c| c.certs_only);
+            if !certs_only {
+                source
+                    .add(provider, pin, lifetime)
+                    .map_err(AgentError::Backend)?;
+            }
+            let Some(certs) = certs else {
+                return Ok(());
+            };
+            let (matching, others): (Vec<_>, Vec<_>) = certs
+                .certs
+                .into_iter()
+                .partition(|c| c.certifies(key.public_key()));
+            if !others.is_empty() {
+                tracing::warn!(
+                    key = key.comment(),
+                    skipped = others.len(),
+                    "certificates for another key skipped"
+                );
+            }
+            if matching.is_empty() && certs_only {
+                return Err(AgentError::NoMatchingCertificate);
+            }
+            for cert in matching {
+                tracing::info!(
+                    key = key.comment(),
+                    key_id = cert.certificate().key_id(),
+                    "serving certificate"
+                );
+                self.push_cert(
+                    CertIdentity {
+                        cert,
+                        comment: key.comment().to_owned(),
+                        signer: CertSigner::Provider(key.clone()),
+                    },
+                    lifetime,
+                );
+            }
+            Ok(())
+        })
+    }
+
+    /// `ssh-add -e PROVIDER`: stop serving the key it names and the
+    /// certificates attached to it. Returns whether anything was removed.
+    fn remove_smartcard(&self, provider: &[u8]) -> Result<bool, AgentError> {
+        let source = self
+            .smartcard
+            .as_ref()
+            .ok_or(AgentError::NoSmartcardProvider)?;
+        let removed = source.remove(provider).map_err(AgentError::Backend)?;
+        let mut any = removed.served;
+        if let Some(blob) = removed.key_blob {
+            any |= self.release(&blob, removed.served);
+        }
+        Ok(any)
+    }
+
+    /// `ssh-add -X`: unlock if the passphrase matches. Fails when the agent
+    /// is not locked.
+    ///
+    /// A wrong passphrase is answered only after a delay that grows by 0.1 s
+    /// with each failure, up to 10 s, as OpenSSH does, so the passphrase
+    /// cannot be guessed quickly through the socket.
+    fn handle_unlock(&self, passphrase: &[u8]) -> Vec<u8> {
+        if !self.is_locked() {
+            tracing::warn!("unlock request refused: agent is not locked");
+            return wire::failure();
+        }
+        // Held through the delay, so guesses are taken one at a time however
+        // many connections send them.
+        let mut failures = lock(&self.unlock_failures);
+        if self.unlock(passphrase) {
+            *failures = 0;
+            tracing::info!("agent unlocked");
+            return wire::success();
+        }
+        *failures = (*failures + 1).min(MAX_UNLOCK_FAILURES);
+        let delay = self.unlock_backoff * *failures;
+        tracing::warn!(
+            failures = *failures,
+            ?delay,
+            "unlock request refused: wrong passphrase"
+        );
+        std::thread::sleep(delay);
+        wire::failure()
+    }
+
+    /// Answer an `SSH_AGENTC_EXTENSION` request. The built-in
+    /// `session-bind@openssh.com` and `query` extensions are answered here; any
+    /// other name goes to the handler registered under it, locked or not, which
+    /// sees the lock state through [`ExtensionContext`] and decides for itself.
+    fn handle_extension(&self, name: &str, data: &[u8], connection: &mut Connection) -> Vec<u8> {
+        match name {
+            destination::QUERY => {
+                tracing::debug!("extension query");
+                return destination::query_reply();
+            }
+            destination::SESSION_BIND => {
+                return match session_bind(data, connection) {
+                    Ok(()) => {
+                        tracing::debug!("session bound");
+                        wire::success()
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "session bind refused");
+                        wire::failure()
+                    }
+                };
+            }
+            _ => {}
+        }
+        let extension = lock(&self.extensions)
+            .iter()
+            .rev()
+            .find(|e| e.name() == name)
+            .cloned();
+        match extension {
+            Some(extension) => {
+                tracing::debug!(extension = %name, "extension request");
+                let ctx = ExtensionContext::new(self.is_locked());
+                extension.handle(&ctx, data).into_body()
+            }
+            None => {
+                tracing::debug!(extension = %name, "unsupported extension request");
+                wire::extension_failure()
+            }
+        }
+    }
+
+    /// The constraints of the key whose public key blob is `key_blob`. For a
+    /// certificate the constraints are those of the key that signs for it.
+    fn meta_for(&self, key_blob: &[u8]) -> KeyMeta {
+        if let Some(meta) = lock(&self.meta).get(key_blob) {
+            return meta.clone();
+        }
+        let certificate = lock(&self.certs)
+            .iter()
+            .find(|e| e.item.cert.blob() == key_blob)
+            .map(|e| e.item.clone());
+        if let Some(identity) = certificate
+            && let Some(signer) = self.cert_signer(&identity)
+            && let Some(meta) = lock(&self.meta).get(&signer.key_blob())
+        {
+            return meta.clone();
+        }
+        KeyMeta::default()
+    }
+
+    /// The lifetime of a key added with `lifetime` from `ssh-add -t`: the
+    /// agent's default without one. A zero, which `ssh-add` never sends, also
+    /// gets the default rather than escaping it.
+    fn lifetime_for(&self, lifetime: Option<u32>) -> Option<u32> {
+        lifetime.filter(|secs| *secs > 0).or(self.default_lifetime)
+    }
+
+    /// Record `meta` for the key `blob` before `publish` serves it, so a sign
+    /// on another connection never finds the key without its constraints.
+    /// If publishing fails, the key's previous constraints are put back.
+    fn publish_constrained<T>(
+        &self,
+        blob: Vec<u8>,
+        meta: KeyMeta,
+        publish: impl FnOnce() -> Result<T, AgentError>,
+    ) -> Result<T, AgentError> {
+        let previous = lock(&self.meta).get(&blob).cloned();
+        self.set_meta(blob.clone(), meta);
+        let published = publish();
+        if published.is_err() {
+            self.set_meta(blob, previous.unwrap_or_default());
+        }
+        published
+    }
+
+    /// Record or clear the constraints of an added key.
+    fn set_meta(&self, blob: Vec<u8>, meta: KeyMeta) {
+        let mut map = lock(&self.meta);
+        if meta.is_empty() {
+            map.remove(&blob);
+        } else {
+            map.insert(blob, meta);
+        }
+    }
+
+    /// Clear the constraints of the added key `key_blob` once nothing signs
+    /// with it: its certificate is served on its own and keeps them after
+    /// the plain key is removed.
+    fn forget_meta(&self, key_blob: &[u8]) {
+        let in_use = lock(&self.held)
+            .iter()
+            .any(|e| e.item.key_blob() == key_blob)
+            || lock(&self.certs).iter().any(
+                |e| matches!(&e.item.signer, CertSigner::Held(key) if key.key_blob() == key_blob),
+            );
+        if !in_use {
+            lock(&self.meta).remove(key_blob);
+        }
+    }
+
+    /// Whether this connection may add, replace or remove the key with
+    /// `key_blob`, which a destination constraint can forbid even though the
+    /// key is served.
+    fn may_manage(&self, key_blob: &[u8], connection: &Connection) -> bool {
+        let meta = self.meta_for(key_blob);
+        meta.destination.is_empty() || connection.permits(&meta.destination, None)
+    }
+
+    /// Drop every identity: the backends', the keys added with
+    /// `ssh-add FILE` and every certificate. Backs `ssh-add -D`.
+    fn remove_all(&self) {
+        for backend in &self.backends {
+            backend.remove_all();
+        }
+        lock(&self.held).clear();
+        lock(&self.certs).clear();
+        lock(&self.meta).clear();
+        self.lifecycle.iter().for_each(|hook| hook.cleared());
+    }
+
+    /// Sign `data` with the key `key_blob` names, as a sign request on
+    /// `connection` would, and return the `SSH2_AGENT_SIGN_RESPONSE` body.
+    /// `flags` are the request's `SSH_AGENT_RSA_SHA2_*` bits.
+    pub fn sign(
+        &self,
+        key_blob: &[u8],
+        data: &[u8],
+        flags: u32,
+        connection: &Connection,
+    ) -> Result<Vec<u8>, AgentError> {
+        let signer = self.signer_for(key_blob)?;
+        self.check_constraints(&signer, key_blob, data, connection)?;
+        let info = SignInfo {
+            key: signer.public_key(),
+            data,
+            connection,
+        };
+        if let Some(policy) = &self.policy
+            && !policy.allow_sign(&info)
+        {
+            return Err(AgentError::PolicyRefused);
+        }
+        let hash = match wire::rsa_hash(flags) {
+            Some(hash) => hash,
+            None if signer.public_key().algorithm().is_rsa() => {
+                return Err(AgentError::Sha1Requested);
+            }
+            None => HashAlg::default(),
+        };
+        let sig = signer.sign(data, hash).map_err(AgentError::Backend)?;
+        signer.verify(data, &sig).map_err(AgentError::Backend)?;
+        if let Some(policy) = &self.policy {
+            policy.signed(&info);
+        }
+        Ok(wire::sign_response(&sig))
+    }
+
+    /// Enforce the `ssh-add -c` and `-h` constraints of the key a sign
+    /// request names: destination-constrained keys need a session binding
+    /// that matches, and confirmed keys ask the user every time.
+    fn check_constraints(
+        &self,
+        signer: &SignerRef,
+        requested_blob: &[u8],
+        data: &[u8],
+        connection: &Connection,
+    ) -> Result<(), AgentError> {
+        let meta = self.meta_for(&signer.key_blob());
+        if !meta.destination.is_empty() {
+            let last = connection
+                .bindings()
+                .last()
+                .ok_or(AgentError::DestinationRefused)?;
+            let expected = PublicKey::from_bytes(requested_blob)
+                .map_err(|_| AgentError::DestinationRefused)?;
+            let userauth = destination::parse_userauth_request(data, &expected)
+                .ok_or(AgentError::UnidentifiedSignature)?;
+            let forwarded = connection.bindings().len() > 1 && userauth.hostkey.is_none();
+            let mismatch = userauth
+                .hostkey
+                .as_ref()
+                .is_some_and(|hostkey| hostkey.key_data() != last.key.key_data());
+            if userauth.session_id != last.session_id
+                || forwarded
+                || mismatch
+                || !connection.permits(&meta.destination, Some(&userauth.user))
+            {
+                return Err(AgentError::DestinationRefused);
+            }
+        }
+        if meta.confirm {
+            let key = signer.public_key();
+            let request = ConfirmRequest {
+                identity: key.comment().to_owned(),
+                fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                subject: wire::describe_data(data),
+            };
+            let answer = self.confirm.as_ref().and_then(|c| c.confirm(&request));
+            if answer != Some(true) {
+                return Err(AgentError::ConfirmRefused);
+            }
+        }
+        Ok(())
+    }
+
+    /// The key that signs for `key_blob`: a backend's key, one added with
+    /// `ssh-add FILE`, or the key a served certificate certifies. Expired
+    /// identities are dropped first.
+    pub fn signer_for(&self, key_blob: &[u8]) -> Result<SignerRef, AgentError> {
+        self.purge_expired();
+        if let Some(key) = self.backend_key(key_blob) {
+            return Ok(key);
+        }
+        let held = lock(&self.held)
+            .iter()
+            .find(|e| e.item.key_blob() == key_blob)
+            .map(|e| e.item.clone());
+        if let Some(key) = held {
+            return Ok(key);
+        }
+        let cert = lock(&self.certs)
+            .iter()
+            .find(|e| e.item.cert.blob() == key_blob)
+            .map(|e| e.item.clone());
+        match cert {
+            Some(identity) if identity.cert.expired() => {
+                tracing::warn!(
+                    key_id = identity.cert.certificate().key_id(),
+                    "certificate has expired"
+                );
+                Err(AgentError::UnknownKey)
+            }
+            Some(identity) => self.cert_signer(&identity).ok_or(AgentError::UnknownKey),
+            None => Err(AgentError::UnknownKey),
+        }
+    }
+}
+
+/// Parse and record one `session-bind@openssh.com` request:
+/// `hostkey`, `session identifier`, `signature`, `is_forwarding`.
+fn session_bind(data: &[u8], connection: &mut Connection) -> Result<(), destination::BindError> {
+    let mut reader = data;
+    let hostkey_blob = Vec::<u8>::decode(&mut reader)?;
+    let hostkey = PublicKey::from_bytes(&hostkey_blob)?;
+    let session_id = Vec::<u8>::decode(&mut reader)?;
+    let signature = Vec::<u8>::decode(&mut reader)?;
+    let forwarding = u8::decode(&mut reader)?;
+    if !reader.is_empty() {
+        return Err(destination::BindError::TrailingData);
+    }
+    connection.bind(hostkey, &session_id, &signature, forwarding != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssh_encoding::Encode;
+    use std::time::Instant;
+
+    fn local_key(seed: u8, comment: &str) -> (Vec<u8>, PublicKey) {
+        use ssh_key::private::Ed25519Keypair;
+        let pair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let public = PublicKey::new(ssh_key::public::KeyData::Ed25519(pair.public), comment);
+        let mut body = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-ed25519".encode(&mut body).unwrap();
+        pair.encode(&mut body).unwrap();
+        comment.encode(&mut body).unwrap();
+        (body, public)
+    }
+
+    /// Each wrong unlock passphrase waits longer than the last; the right one
+    /// answers at once and resets the count.
+    #[test]
+    fn wrong_unlock_passphrases_are_slowed_down() {
+        let agent = Agent::new().with_unlock_backoff(Duration::from_millis(20));
+        assert!(agent.lock(b"hunter2"));
+
+        let mut wrong = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter3".as_slice().encode(&mut wrong).unwrap();
+        for failures in 1..=3u32 {
+            let started = Instant::now();
+            assert_eq!(agent.handle(&wrong), wire::failure());
+            assert!(started.elapsed() >= Duration::from_millis(20) * failures);
+            assert_eq!(*agent.unlock_failures.lock().unwrap(), failures);
+        }
+
+        let mut right = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut right).unwrap();
+        assert_eq!(agent.handle(&right), wire::success());
+        assert_eq!(*agent.unlock_failures.lock().unwrap(), 0);
+    }
+
+    /// Guesses sent on parallel connections wait their turn, so more
+    /// connections do not mean more guesses per second.
+    #[test]
+    fn parallel_unlock_guesses_are_taken_one_at_a_time() {
+        let agent = Agent::new().with_unlock_backoff(Duration::from_millis(20));
+        assert!(agent.lock(b"hunter2"));
+        let agent = Arc::new(agent);
+
+        let mut wrong = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter3".as_slice().encode(&mut wrong).unwrap();
+        let started = Instant::now();
+        let guesses: Vec<_> = (0..4)
+            .map(|_| {
+                let agent = Arc::clone(&agent);
+                let wrong = wrong.clone();
+                std::thread::spawn(move || agent.handle(&wrong))
+            })
+            .collect();
+        for guess in guesses {
+            assert_eq!(guess.join().unwrap(), wire::failure());
+        }
+        // 20 + 40 + 60 + 80 ms one after another.
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn local_key_lifetime_expires() {
+        let agent = Agent::new();
+        let (add, _) = local_key(0x11, "ferris@example.com");
+        // A constrained add with a one-second lifetime.
+        let mut constrained = add;
+        constrained[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_LIFETIME
+            .encode(&mut constrained)
+            .unwrap();
+        1u32.encode(&mut constrained).unwrap();
+        assert_eq!(agent.handle(&constrained), wire::success());
+        assert_eq!(agent.public_keys().len(), 1);
+
+        // Pretend the lifetime elapsed.
+        agent.held.lock().unwrap()[0].expires = Some(Instant::now());
+        assert!(agent.public_keys().is_empty());
+    }
+
+    /// `ssh-agent -t`, as [`Agent::with_default_lifetime`]: keys added
+    /// without their own lifetime get the default, and an explicit `-t` wins.
+    #[test]
+    fn default_lifetime_applies_to_added_keys() {
+        let agent = Agent::new().with_default_lifetime(Some(60));
+        let (add, _) = local_key(0x12, "default@example.com");
+        assert_eq!(agent.handle(&add), wire::success());
+        let expires = agent.held.lock().unwrap()[0]
+            .expires
+            .expect("the default set a lifetime");
+        assert!(expires > Instant::now() + Duration::from_secs(30));
+
+        // An explicit `ssh-add -t` lifetime is used instead of the default.
+        let agent = Agent::new().with_default_lifetime(Some(60));
+        let (mut constrained, _) = local_key(0x13, "explicit@example.com");
+        constrained[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_LIFETIME
+            .encode(&mut constrained)
+            .unwrap();
+        1u32.encode(&mut constrained).unwrap();
+        assert_eq!(agent.handle(&constrained), wire::success());
+        let expires = agent.held.lock().unwrap()[0]
+            .expires
+            .expect("the explicit lifetime was set");
+        assert!(expires < Instant::now() + Duration::from_secs(5));
+
+        // A zero lifetime does not escape the default.
+        let (mut zero, _) = local_key(0x14, "zero@example.com");
+        zero[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_LIFETIME
+            .encode(&mut zero)
+            .unwrap();
+        0u32.encode(&mut zero).unwrap();
+        assert_eq!(agent.handle(&zero), wire::success());
+        let expires = agent.held.lock().unwrap()[1]
+            .expires
+            .expect("the default set a lifetime");
+        assert!(expires > Instant::now() + Duration::from_secs(30));
+    }
+
+    /// A constraint given twice is refused, as OpenSSH refuses it.
+    #[test]
+    fn a_duplicate_constraint_is_refused() {
+        let agent = Agent::new();
+        let (mut add, _) = local_key(0x15, "twice@example.com");
+        add[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        assert_eq!(agent.handle(&add), wire::failure());
+        assert!(agent.held.lock().unwrap().is_empty());
+    }
+
+    fn ed25519(seed: u8, comment: &str) -> SignerRef {
+        let pair = ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]);
+        let mut body = Vec::new();
+        pair.encode(&mut body).unwrap();
+        comment.encode(&mut body).unwrap();
+        crate::local::decode("ssh-ed25519", &mut body.as_slice())
+            .map(SignerRef::new)
+            .unwrap()
+    }
+
+    fn sign_body(blob: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
+        blob.encode(&mut sign).unwrap();
+        data.encode(&mut sign).unwrap();
+        0u32.encode(&mut sign).unwrap();
+        sign
+    }
+
+    /// A backend's keys are listed first, sign, and go on `ssh-add -d`.
+    #[test]
+    fn backend_keys_are_listed_signed_and_removed() {
+        use crate::testing::MemoryBackend;
+        let key = ed25519(1, "backend@example.com");
+        let backend = Arc::new(MemoryBackend::new([key.clone()]));
+        let agent = Agent::new().with_backend(Arc::clone(&backend) as _);
+        let (add, added) = local_key(2, "added@example.com");
+        assert_eq!(agent.handle(&add), wire::success());
+        assert_eq!(
+            agent.identities(),
+            vec![wire::listed(key.public_key()), wire::listed(&added)]
+        );
+
+        let reply = agent.handle(&sign_body(&key.key_blob(), b"data"));
+        assert_eq!(reply[0], wire::SSH2_AGENT_SIGN_RESPONSE);
+
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        key.key_blob().encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert!(backend.0.lock().unwrap().is_empty());
+        assert_eq!(agent.identities().len(), 1);
+    }
+
+    /// A signer whose signature does not verify never gets it out.
+    #[test]
+    fn a_bad_signature_is_refused() {
+        struct Liar(SignerRef);
+        impl crate::Signer for Liar {
+            fn public_key(&self) -> &PublicKey {
+                self.0.public_key()
+            }
+            fn sign(&self, _data: &[u8], hash: HashAlg) -> Result<ssh_key::Signature, BoxError> {
+                self.0.sign(b"something else", hash)
+            }
+        }
+        let key = SignerRef::new(Liar(ed25519(1, "liar")));
+        let agent =
+            Agent::new().with_backend(Arc::new(crate::testing::MemoryBackend::new([key.clone()])));
+        assert!(matches!(
+            agent.sign(&key.key_blob(), b"data", 0, &Connection::default()),
+            Err(AgentError::Backend(_))
+        ));
+    }
+
+    /// `ssh-add -c` keys ask the confirm prompt each time; with none, or a
+    /// "no", they do not sign.
+    #[test]
+    fn confirmed_keys_ask_each_time() {
+        use crate::testing::RecordingConfirm;
+        let (mut add, public) = local_key(1, "ferris@example.com");
+        add[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        let blob = public.to_bytes().unwrap();
+
+        let unasked = Agent::new();
+        assert_eq!(unasked.handle(&add), wire::success());
+        assert_eq!(unasked.handle(&sign_body(&blob, b"data")), wire::failure());
+
+        let confirm = Arc::new(RecordingConfirm::answering([Some(true), Some(false)]));
+        let agent = Agent::new().with_confirm(Arc::clone(&confirm) as _);
+        assert_eq!(agent.handle(&add), wire::success());
+        assert_eq!(agent.handle(&sign_body(&blob, b"data"))[0], 14);
+        assert_eq!(agent.handle(&sign_body(&blob, b"data")), wire::failure());
+        let requests = confirm.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].identity, "ferris@example.com");
+    }
+
+    /// A policy can veto signatures and key changes, and hears each signature.
+    #[test]
+    fn the_policy_vetoes_and_audits() {
+        #[derive(Default)]
+        struct OnlyTagged(Mutex<Vec<String>>);
+        impl Policy for OnlyTagged {
+            fn allow_sign(&self, request: &SignInfo<'_>) -> bool {
+                request.data.starts_with(b"ok:")
+            }
+            fn signed(&self, request: &SignInfo<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(request.key.comment().to_owned());
+            }
+            fn allow_manage(&self, connection: &Connection) -> bool {
+                !connection.bind_attempted()
+            }
+        }
+        let policy = Arc::new(OnlyTagged::default());
+        let agent = Agent::new().with_policy(Arc::clone(&policy) as _);
+        let (add, public) = local_key(1, "ferris@example.com");
+        assert_eq!(agent.handle(&add), wire::success());
+        let blob = public.to_bytes().unwrap();
+        assert_eq!(agent.handle(&sign_body(&blob, b"no")), wire::failure());
+        assert_eq!(agent.handle(&sign_body(&blob, b"ok: fine"))[0], 14);
+        assert_eq!(*policy.0.lock().unwrap(), vec!["ferris@example.com"]);
+        assert!(matches!(
+            agent.sign(&blob, b"no", 0, &Connection::default()),
+            Err(AgentError::PolicyRefused)
+        ));
+    }
+
+    /// `ssh-add -s`/`-e` reach the smartcard provider, which owns the key;
+    /// without one they fail.
+    #[test]
+    fn smartcard_requests_reach_the_provider() {
+        use crate::testing::MemoryBackend;
+        struct Card(MemoryBackend, SignerRef);
+        impl SmartcardProvider for Card {
+            fn resolve(
+                &self,
+                provider: &[u8],
+                _pin: &Zeroizing<Vec<u8>>,
+            ) -> Result<SignerRef, BoxError> {
+                match provider {
+                    b"card" => Ok(self.1.clone()),
+                    _ => Err("no such card".into()),
+                }
+            }
+            fn add(
+                &self,
+                provider: &[u8],
+                pin: &Zeroizing<Vec<u8>>,
+                _lifetime: Option<u32>,
+            ) -> Result<(), BoxError> {
+                let key = self.resolve(provider, pin)?;
+                self.0.0.lock().unwrap().push(key);
+                Ok(())
+            }
+            fn remove(&self, provider: &[u8]) -> Result<crate::Removed, BoxError> {
+                let key = self.resolve(provider, &Zeroizing::new(Vec::new()))?;
+                Ok(crate::Removed {
+                    served: Backend::remove(&self.0, &key.key_blob()),
+                    key_blob: Some(key.key_blob()),
+                })
+            }
+        }
+        impl Backend for Card {
+            fn identities(&self) -> Vec<SignerRef> {
+                self.0.identities()
+            }
+        }
+
+        let card = Arc::new(Card(MemoryBackend::default(), ed25519(7, "card")));
+        let agent = Agent::new()
+            .with_backend(Arc::clone(&card) as _)
+            .with_smartcard(Arc::clone(&card) as _);
+        let request = |kind: u8, provider: &[u8]| {
+            let mut body = vec![kind];
+            provider.encode(&mut body).unwrap();
+            b"".as_slice().encode(&mut body).unwrap();
+            body
+        };
+        let add = request(wire::SSH_AGENTC_ADD_SMARTCARD_KEY, b"card");
+        let remove = request(wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY, b"card");
+        assert_eq!(agent.handle(&add), wire::success());
+        assert_eq!(agent.identities().len(), 1);
+        assert_eq!(
+            agent.handle(&request(wire::SSH_AGENTC_ADD_SMARTCARD_KEY, b"other")),
+            wire::failure()
+        );
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert!(agent.identities().is_empty());
+        assert_eq!(agent.handle(&remove), wire::failure());
+
+        assert_eq!(Agent::new().handle(&add), wire::failure());
+    }
+
+    /// Lifecycle hooks hear lock, unlock and `ssh-add -D`.
+    #[test]
+    fn lifecycle_hooks_hear_state_changes() {
+        #[derive(Default)]
+        struct Log(Mutex<Vec<&'static str>>);
+        impl Lifecycle for Log {
+            fn locked(&self) {
+                self.0.lock().unwrap().push("locked");
+            }
+            fn unlocked(&self) {
+                self.0.lock().unwrap().push("unlocked");
+            }
+            fn cleared(&self) {
+                self.0.lock().unwrap().push("cleared");
+            }
+        }
+        let log = Arc::new(Log::default());
+        let agent = Agent::new().with_lifecycle(Arc::clone(&log) as _);
+        assert!(agent.lock(b"pass"));
+        assert!(!agent.lock(b"pass"));
+        assert!(!agent.unlock(b"wrong"));
+        assert!(agent.unlock(b"pass"));
+        assert_eq!(
+            agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]),
+            wire::success()
+        );
+        assert_eq!(
+            *log.0.lock().unwrap(),
+            vec!["locked", "unlocked", "cleared"]
+        );
+    }
+}
