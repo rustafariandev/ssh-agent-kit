@@ -7,7 +7,7 @@ socket with `SSH_AUTH_SOCK=SOCKET`.
 | Example | Shows | Run |
 |---|---|---|
 | [`file-agent`](file-agent.rs) | The basics: hold `ssh-add FILE` keys, a `Confirm` prompt for `ssh-add -c`, and an audit `Policy` | `file-agent SOCKET` |
-| [`keydir-agent`](keydir-agent.rs) | A `Backend` + `Signer`: serve the unencrypted keys in a directory, re-read on every listing | `keydir-agent DIR SOCKET` |
+| [`keydir-agent`](keydir-agent.rs) | A `Backend` + `Signer`: serve the unencrypted ed25519, ECDSA and RSA keys in a directory, re-read on every listing; RSA honours the requested digest and overrides `Signer::verify` | `keydir-agent DIR SOCKET` |
 | [`derived-card`](derived-card.rs) | A `SmartcardProvider` that is also a `Backend`: `ssh-add -s NAME` derives a key from a seed, honouring `ssh-add -t` with `Expiring` | `derived-card SOCKET` |
 | [`policy-agent`](policy-agent.rs) | A `Policy`: allow logins and chosen `ssh-keygen -Y sign` namespaces only; refuse forwarded logins and key changes | `policy-agent SOCKET [NAMESPACE…]` |
 | [`extension-agent`](extension-agent.rs) | An `Extension` that answers `status@example.com`, and a client that asks for it | `extension-agent serve SOCKET` / `ask SOCKET` |
@@ -29,5 +29,5 @@ ssh-add -L
 
 The examples print to stderr and keep running until killed. They use
 `ssh-agent-kit`'s own dependencies (`ssh-encoding`, `signature`, `sha2`,
-`rand_core`, `zeroize`). An agent of your own adds those it uses to its
+`rsa`, `rand_core`, `zeroize`). An agent of your own adds those it uses to its
 `Cargo.toml`.
