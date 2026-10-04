@@ -64,6 +64,11 @@ cargo run --example file-agent -- /tmp/file-agent.sock &
 SSH_AUTH_SOCK=/tmp/file-agent.sock ssh-add ~/.ssh/id_ed25519
 ```
 
+[`examples/`](examples/README.md) has one small agent per extension point: a
+key-directory backend, a smartcard provider, a signing policy, a protocol
+extension, an idle-wipe handler with lifecycle hooks, and an in-process
+transport.
+
 [okagent](https://github.com/rustafariandev/onlykey-rs) is a full agent built
 on this crate. It serves OnlyKey hardware keys and FIDO security keys.
 

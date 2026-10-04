@@ -29,5 +29,8 @@ First release, extracted from the agent in
   `Listener`/`Stream`/`Handler`.
 - A minimal agent client (`client::add_identity`).
 - Test doubles behind the `test-util` feature.
+- Examples, one per extension point: `file-agent`, `keydir-agent`,
+  `derived-card`, `policy-agent`, `extension-agent`, `idle-agent` and
+  `in-process`.
 
 [0.1.0]: https://github.com/rustafariandev/ssh-agent-kit/releases/tag/v0.1.0
