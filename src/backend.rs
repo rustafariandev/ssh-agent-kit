@@ -19,13 +19,13 @@ use zeroize::Zeroizing;
 
 /// A source of identities the agent serves on its owner's behalf.
 ///
-/// Every method may be called while the agent takes key changes one at a
-/// time, since a key change looks up, purges and removes backend keys: a
-/// request that changes keys (through [`Agent::handle`](crate::Agent::handle))
-/// made from one, or made on another thread while holding a lock one takes,
-/// waits for the current change to finish, so never returns.
+/// [`Self::remove`] and [`Self::remove_all`] are called while the agent
+/// commits a key change, which it does one at a time. A request that
+/// changes keys (through [`Agent::handle`](crate::Agent::handle)) made from
+/// one of them is refused; one made on another thread while holding a lock
+/// they take waits for the commit to finish, so never returns.
 /// [`Agent::release`](crate::Agent::release) and the agent's other methods
-/// may be called.
+/// may be called. The other methods are called with no lock held.
 pub trait Backend: Send + Sync {
     /// Every identity to list, fetching what is not known yet (which may
     /// mean talking to a device). Keys that cannot be fetched are left out,
@@ -72,12 +72,13 @@ pub struct Removed {
 /// its own device. The agent handles constraints, lifetimes' defaults and
 /// attached certificates around these calls.
 ///
-/// Every method is called while the agent takes key changes one at a time:
-/// a request that changes keys (through
-/// [`Agent::handle`](crate::Agent::handle)) made from one waits for the
-/// current one to finish, so never returns, and a slow call, such as a PIN
-/// prompt, holds up other connections' key changes (not their listings or
-/// signatures) until it returns.
+/// [`Self::add`] and [`Self::remove`] are called while the agent commits a
+/// key change, which it does one at a time: a request that changes keys
+/// (through [`Agent::handle`](crate::Agent::handle)) made from one is
+/// refused, and a slow call holds up other connections' key changes (not
+/// their listings or signatures) until it returns. [`Self::resolve`] is
+/// called before, with no lock held, so a PIN prompt there holds up no
+/// one.
 pub trait SmartcardProvider: Send + Sync {
     /// The key `provider` names, fetched (or found in a cache) but not
     /// served yet. `pin` is the one `ssh-add -s` read, often empty.
@@ -105,11 +106,8 @@ pub trait Lifecycle: Send + Sync {
     /// `ssh-add -X` unlocked it.
     fn unlocked(&self) {}
 
-    /// `ssh-add -D` removed every identity.
-    ///
-    /// Called while the agent takes key changes one at a time: a request
-    /// that changes keys (through [`Agent::handle`](crate::Agent::handle))
-    /// made from here waits for this one to finish, so never returns.
+    /// `ssh-add -D` removed every identity. Called once the change is
+    /// committed, with no lock held, so it may change keys itself.
     fn cleared(&self) {}
 }
 

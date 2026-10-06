@@ -44,6 +44,9 @@ follows [Semantic Versioning](https://semver.org/).
 - A key change that waited for another connection's, such as one held up
   by a PIN prompt, still ran if the agent was locked meanwhile. It is now
   refused.
+- A key change asked for from a backend's or provider's callback while
+  the agent committed another, on the same thread, waited on itself
+  forever. It is now refused, with an error logged.
 - A `Handler::tick` that waited, such as one making a key change while
   another connection's was held up by a PIN prompt, stopped `serve` from
   accepting connections until it returned. Ticks now run on a thread of
@@ -58,9 +61,14 @@ follows [Semantic Versioning](https://semver.org/).
   signs for it, so a key and what was attached to it come and go together.
   Expired keys are dropped, and their secrets freed, by the first read or
   change after they expire.
-- Every `Backend` method, not only `remove` and `remove_all`, is documented
-  as possibly called while key changes are taken one at a time, since a key
-  change looks up and purges backend keys too.
+- Key changes no longer hold their lock while looking keys up, asking the
+  policy or the provider for the key, or calling the `cleared` hook. Those
+  run first, with no lock held; the change then takes its turn and, if
+  other changes landed meanwhile, prepares again. Only a backend's
+  `remove`/`remove_all` and a provider's `add`/`remove` run during the
+  turn, so a PIN prompt in `SmartcardProvider::resolve` no longer holds up
+  other connections' key changes, and `Policy::allow_manage` and
+  `Lifecycle::cleared` may change keys themselves.
 
 ## [0.1.0] - 2026-10-04
 

@@ -14,6 +14,7 @@ use crate::wire::{self, Request};
 use arc_swap::ArcSwap;
 use ssh_encoding::Decode;
 use ssh_key::{HashAlg, PublicKey};
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
@@ -82,10 +83,11 @@ pub struct Agent {
     /// immutable snapshot: a read loads it without locking, and a write
     /// publishes a changed copy (see [`Self::write`]).
     store: ArcSwap<Store>,
-    /// Held through each key change a client asks for, the requests
-    /// [`Request::changes_keys`] groups as writes. A change that reaches a
-    /// backend or provider publishes the store more than once, so two
-    /// changes must not interleave.
+    /// Held through the commit of each key change a client asks for, the
+    /// requests [`Request::changes_keys`] groups as writes (see
+    /// [`Self::prepared_turn`]). A change that reaches a backend or provider
+    /// publishes the store more than once, so two commits must not
+    /// interleave.
     changes: Mutex<()>,
     /// Protocol extension handlers, matched by name, replaced as a whole on
     /// each registration.
@@ -546,8 +548,40 @@ impl Store {
         !(Arc::ptr_eq(&self.provider, &other.provider) && Arc::ptr_eq(&self.held, &other.held))
     }
 
+    /// Whether this snapshot and `other` hold the same keys, certificates
+    /// and constraints: true only when no collection was replaced.
+    fn same_keys(&self, other: &Store) -> bool {
+        Arc::ptr_eq(&self.held, &other.held)
+            && Arc::ptr_eq(&self.provider, &other.provider)
+            && Arc::ptr_eq(&self.served, &other.served)
+    }
+
     fn clear(&mut self) {
         *self = Store::default();
+    }
+}
+
+thread_local! {
+    /// The agents, by address, whose key-change turn this thread holds.
+    static TURNS_HELD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// This thread's turn to commit a key change to one agent: `changes` held,
+/// and recorded so that a key change asked for from inside it, by a
+/// callback on this thread, is refused rather than waiting on itself.
+struct ChangeTurn<'a> {
+    _changes: MutexGuard<'a, ()>,
+    agent: usize,
+}
+
+impl Drop for ChangeTurn<'_> {
+    fn drop(&mut self) {
+        TURNS_HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(at) = held.iter().rposition(|agent| *agent == self.agent) {
+                held.remove(at);
+            }
+        });
     }
 }
 
@@ -826,6 +860,60 @@ impl Agent {
         self.store.load_full()
     }
 
+    /// Take the turn to commit a key change, waiting for any other
+    /// connection's commit. Refused, with an error logged, when this thread
+    /// already holds it, as a callback called during a commit would, since
+    /// waiting would never end; and once the agent is locked, which it may
+    /// have been while this change waited.
+    fn take_turn(&self) -> Option<ChangeTurn<'_>> {
+        let agent = std::ptr::from_ref(self) as usize;
+        if TURNS_HELD.with(|held| held.borrow().contains(&agent)) {
+            tracing::error!(
+                "refused: a key change was asked for from inside another, on the same \
+                 thread, so it would wait on itself"
+            );
+            return None;
+        }
+        let changes = lock(&self.changes);
+        TURNS_HELD.with(|held| held.borrow_mut().push(agent));
+        let turn = ChangeTurn {
+            _changes: changes,
+            agent,
+        };
+        if self.is_locked() {
+            tracing::warn!("refused: the agent is locked");
+            return None;
+        }
+        Some(turn)
+    }
+
+    /// Prepare a key change, then take the turn to commit it. `prepare`
+    /// runs with no lock held, against a snapshot: it looks keys up and asks
+    /// the policy, user code that only reads, so none of it can wait on a
+    /// commit. If the keys changed before the turn was taken, it runs again
+    /// on the newer snapshot; if they keep changing, the change is refused.
+    /// The commit, under the returned turn, makes only the calls that change
+    /// a backend or provider, and the store writes.
+    ///
+    /// Fails with what `prepare` failed with, or with `None` when the turn
+    /// was refused (see [`Self::take_turn`]) or the keys kept changing.
+    fn prepared_turn<P, E>(
+        &self,
+        mut prepare: impl FnMut(&Store) -> Result<P, E>,
+    ) -> Result<(P, ChangeTurn<'_>), Option<E>> {
+        for _ in 0..LOOKUP_ATTEMPTS {
+            let seen = self.snapshot();
+            let prepared = prepare(&seen).map_err(Some)?;
+            let turn = self.take_turn().ok_or(None)?;
+            if self.snapshot().same_keys(&seen) {
+                return Ok((prepared, turn));
+            }
+            tracing::debug!("keys changed while a key change was prepared");
+        }
+        tracing::warn!("keys kept changing; key change refused");
+        Err(None)
+    }
+
     /// Change the store: `change` runs on a copy of the current snapshot,
     /// with expired identities dropped, and the copy is published unless
     /// another write was published first, in which case `change` runs again
@@ -1090,15 +1178,11 @@ impl Agent {
     }
 
     /// Answer a request while the agent is unlocked.
+    ///
+    /// Reads work on a store snapshot and never wait. Key changes are
+    /// prepared without a lock and committed one at a time (see
+    /// [`Self::prepared_turn`]).
     fn handle_unlocked(&self, request: Request, connection: &mut Connection) -> Vec<u8> {
-        // Writes are taken one at a time; reads work on a store snapshot and
-        // never wait for them.
-        let writing = request.changes_keys().then(|| lock(&self.changes));
-        // The agent may have been locked while this change waited its turn.
-        if writing.is_some() && self.is_locked() {
-            tracing::warn!(request = request.name(), "refused: agent is locked");
-            return wire::failure();
-        }
         match request {
             Request::RequestIdentities => {
                 let identities = self.identities_for(connection);
@@ -1141,28 +1225,34 @@ impl Agent {
                 destination,
             } => {
                 let lifetime = self.lifetime_for(lifetime);
-                let change = KeyChange::Add {
-                    key: key.public_key(),
-                    certificate: cert.as_deref(),
-                    constraints: KeyConstraints {
-                        lifetime,
-                        confirm,
-                        destination: &destination,
-                    },
-                };
-                if !self.manage_allowed(change, connection) {
-                    return wire::failure();
-                }
                 // The identity this add replaces: a certificate is
                 // constrained apart from its key.
                 let blob = match &cert {
                     Some(cert) => cert.blob().to_vec(),
                     None => key.key_blob(),
                 };
-                if !self.may_manage(&blob, connection) {
-                    tracing::warn!("refused: key not permitted on this connection");
+                let prepared = self.prepared_turn(|store| {
+                    let change = KeyChange::Add {
+                        key: key.public_key(),
+                        certificate: cert.as_deref(),
+                        constraints: KeyConstraints {
+                            lifetime,
+                            confirm,
+                            destination: &destination,
+                        },
+                    };
+                    if !self.manage_allowed(change, connection) {
+                        return Err(());
+                    }
+                    if !self.may_manage(store, &blob, connection) {
+                        tracing::warn!("refused: key not permitted on this connection");
+                        return Err(());
+                    }
+                    Ok(())
+                });
+                let Ok(((), _turn)) = prepared else {
                     return wire::failure();
-                }
+                };
                 let meta = KeyMeta {
                     confirm,
                     destination,
@@ -1171,18 +1261,24 @@ impl Agent {
                 wire::success()
             }
             Request::RemoveIdentity { key_blob } => {
-                let target = self.signer_for(&key_blob).ok();
-                let change = KeyChange::Remove {
-                    key_blob: &key_blob,
-                    key: target.as_ref().map(|t| t.public_key()),
+                let prepared = self.prepared_turn(|store| {
+                    let target = self.lookup(store, &key_blob).ok().map(|(key, _)| key);
+                    let change = KeyChange::Remove {
+                        key_blob: &key_blob,
+                        key: target.as_ref().map(|t| t.public_key()),
+                    };
+                    if !self.manage_allowed(change, connection) {
+                        return Err(());
+                    }
+                    if !self.may_manage(store, &key_blob, connection) {
+                        tracing::warn!("refused: key not permitted on this connection");
+                        return Err(());
+                    }
+                    Ok(self.backend_key(&key_blob).is_some())
+                });
+                let Ok((from_backend, _turn)) = prepared else {
+                    return wire::failure();
                 };
-                if !self.manage_allowed(change, connection) {
-                    return wire::failure();
-                }
-                if !self.may_manage(&key_blob, connection) {
-                    tracing::warn!("refused: key not permitted on this connection");
-                    return wire::failure();
-                }
                 let removed = self.write(|store| {
                     if store.remove_held(&key_blob) {
                         Some("removed added key")
@@ -1195,9 +1291,7 @@ impl Agent {
                 if let Some(removed) = removed {
                     tracing::info!("{removed}");
                     wire::success()
-                } else if self.backend_key(&key_blob).is_some()
-                    && self.backends.iter().any(|b| b.remove(&key_blob))
-                {
+                } else if from_backend && self.backends.iter().any(|b| b.remove(&key_blob)) {
                     self.release(&key_blob, true);
                     tracing::info!("removed key");
                     wire::success()
@@ -1207,10 +1301,18 @@ impl Agent {
                 }
             }
             Request::RemoveAllIdentities => {
-                if !self.manage_allowed(KeyChange::RemoveAll, connection) {
+                let prepared = self.prepared_turn(|_| {
+                    match self.manage_allowed(KeyChange::RemoveAll, connection) {
+                        true => Ok(()),
+                        false => Err(()),
+                    }
+                });
+                let Ok(((), turn)) = prepared else {
                     return wire::failure();
-                }
+                };
                 self.remove_all();
+                drop(turn);
+                self.lifecycle.iter().for_each(|hook| hook.cleared());
                 tracing::info!("removed every identity");
                 wire::success()
             }
@@ -1237,19 +1339,26 @@ impl Agent {
                 };
                 match self.add_smartcard(&provider, &pin, lifetime, meta, certs, connection) {
                     Ok(()) => wire::success(),
-                    Err(e) => {
+                    Err(Some(e)) => {
                         tracing::warn!(error = %e, "cannot add provider key");
                         wire::failure()
                     }
+                    Err(None) => wire::failure(),
                 }
             }
             Request::RemoveSmartcardKey { provider } => {
-                let change = KeyChange::RemoveProvider {
-                    provider: &provider,
-                };
-                if !self.manage_allowed(change, connection) {
+                let prepared = self.prepared_turn(|_| {
+                    let change = KeyChange::RemoveProvider {
+                        provider: &provider,
+                    };
+                    match self.manage_allowed(change, connection) {
+                        true => Ok(()),
+                        false => Err(()),
+                    }
+                });
+                let Ok(((), _turn)) = prepared else {
                     return wire::failure();
-                }
+                };
                 match self.remove_smartcard(&provider) {
                     Ok(true) => {
                         tracing::info!("removed provider key");
@@ -1278,15 +1387,19 @@ impl Agent {
     /// certificates that certify it; the others are skipped. Fails when only
     /// certificates were asked for and none certifies the key. The policy is
     /// asked once the key is fetched, so it can decide by the key.
+    ///
+    /// The key is fetched once, before the change is prepared, since that
+    /// may ask for the PIN; only [`SmartcardProvider::add`] runs while the
+    /// change holds its turn. Fails with `None` when the turn was refused.
     fn add_smartcard(
         &self,
         provider: &[u8],
         pin: &Zeroizing<Vec<u8>>,
         lifetime: Option<u32>,
-        meta: KeyMeta,
+        requested: KeyMeta,
         certs: Option<AssociatedCerts>,
         connection: &Connection,
-    ) -> Result<(), AgentError> {
+    ) -> Result<(), Option<AgentError>> {
         let source = self
             .smartcard
             .as_ref()
@@ -1297,56 +1410,55 @@ impl Agent {
         let key = source.resolve(provider, pin).map_err(AgentError::Backend)?;
         let blob = key.key_blob();
         let certs_only = certs.as_ref().is_some_and(|c| c.certs_only);
-        // `ssh-add -C` adds certificates alone: for a key served under
-        // constraints they share those, rather than replace them for the
-        // key and every certificate it already has.
-        let meta = match self.snapshot().provider_meta(&blob) {
-            Some(current) if certs_only && self.backend_key(&blob).is_some() => {
-                if *current != meta {
-                    tracing::info!(
-                        key = key.comment(),
-                        "certificates take the served key's constraints"
-                    );
+        let offered = certs.map(|c| c.certs).unwrap_or_default();
+        let prepared = self.prepared_turn(|store| {
+            let served = self.backend_key(&blob).is_some();
+            // `ssh-add -C` adds certificates alone: for a key served under
+            // constraints they share those, rather than replace them for the
+            // key and every certificate it already has.
+            let meta = match store.provider_meta(&blob) {
+                Some(current) if certs_only && served => {
+                    if *current != requested {
+                        tracing::info!(
+                            key = key.comment(),
+                            "certificates take the served key's constraints"
+                        );
+                    }
+                    current.clone()
                 }
-                current.clone()
+                _ => requested.clone(),
+            };
+            let change = KeyChange::AddProvider {
+                provider,
+                key: key.public_key(),
+                certificates: &offered,
+                certificates_only: certs_only,
+                constraints: KeyConstraints {
+                    lifetime,
+                    confirm: meta.confirm,
+                    destination: &meta.destination,
+                },
+            };
+            if !self.manage_allowed(change, connection) {
+                return Err(AgentError::PolicyRefused);
             }
-            _ => meta,
-        };
-        let change = KeyChange::AddProvider {
-            provider,
-            key: key.public_key(),
-            certificates: certs.as_ref().map_or(&[], |c| c.certs.as_slice()),
-            certificates_only: certs_only,
-            constraints: KeyConstraints {
-                lifetime,
-                confirm: meta.confirm,
-                destination: &meta.destination,
-            },
-        };
-        if !self.manage_allowed(change, connection) {
-            return Err(AgentError::PolicyRefused);
+            Ok((meta, served))
+        });
+        let ((meta, served), turn) = prepared?;
+        let (matching, others): (Vec<_>, Vec<_>) = offered
+            .into_iter()
+            .partition(|c| c.certifies(key.public_key()));
+        if !others.is_empty() {
+            tracing::warn!(
+                key = key.comment(),
+                skipped = others.len(),
+                "certificates for another key skipped"
+            );
         }
-        let matching = match certs {
-            Some(certs) => {
-                let (matching, others): (Vec<_>, Vec<_>) = certs
-                    .certs
-                    .into_iter()
-                    .partition(|c| c.certifies(key.public_key()));
-                if !others.is_empty() {
-                    tracing::warn!(
-                        key = key.comment(),
-                        skipped = others.len(),
-                        "certificates for another key skipped"
-                    );
-                }
-                if matching.is_empty() && certs_only {
-                    return Err(AgentError::NoMatchingCertificate);
-                }
-                matching
-            }
-            None => Vec::new(),
-        };
-        self.publish_constrained(blob.clone(), meta.clone(), || {
+        if matching.is_empty() && certs_only {
+            return Err(Some(AgentError::NoMatchingCertificate));
+        }
+        self.publish_constrained(blob.clone(), meta.clone(), served, || {
             if !certs_only {
                 source
                     .add(provider, pin, lifetime)
@@ -1354,6 +1466,7 @@ impl Agent {
             }
             Ok(())
         })?;
+        drop(turn);
         if matching.is_empty() {
             return Ok(());
         }
@@ -1366,7 +1479,7 @@ impl Agent {
                 key = key.comment(),
                 "key released while its certificates were added"
             );
-            return Err(AgentError::UnknownKey);
+            return Err(Some(AgentError::UnknownKey));
         }
         let attached = self.write(|store| {
             if !meta.is_empty() && store.provider_meta(&blob) != Some(&meta) {
@@ -1380,7 +1493,7 @@ impl Agent {
                 key = key.comment(),
                 "key released while its certificates were added"
             );
-            return Err(AgentError::UnknownKey);
+            return Err(Some(AgentError::UnknownKey));
         }
         for cert in &matching {
             tracing::info!(
@@ -1509,8 +1622,9 @@ impl Agent {
     /// on another connection never finds the key without its constraints.
     /// If publishing fails, the key's previous constraints are put back.
     ///
-    /// A key already served under constraints keeps them until `publish`
-    /// succeeds, so constraints that would lift some never take effect
+    /// A key already served under constraints (`served` says whether a
+    /// backend serves it, as the change was prepared) keeps them until
+    /// `publish` succeeds, so constraints that would lift some never take effect
     /// while it runs (a PIN prompt, say) or after it fails. Once it succeeds
     /// they are recorded again, in case a backend released the key, and its
     /// constraints with it, while re-serving it.
@@ -1518,9 +1632,9 @@ impl Agent {
         &self,
         blob: Vec<u8>,
         meta: KeyMeta,
+        served: bool,
         publish: impl FnOnce() -> Result<T, AgentError>,
     ) -> Result<T, AgentError> {
-        let served = self.backend_key(&blob).is_some();
         let (previous, deferred) = self.write(|store| {
             let previous = store.provider_meta(&blob).cloned();
             let deferred = served && previous.is_some();
@@ -1549,20 +1663,20 @@ impl Agent {
     }
 
     /// Whether this connection may add, replace or remove the key with
-    /// `key_blob`, which a destination constraint can forbid even though the
-    /// key is served.
-    fn may_manage(&self, key_blob: &[u8], connection: &Connection) -> bool {
-        permitted(&self.constraints_of(&self.snapshot(), key_blob), connection)
+    /// `key_blob` in `store`, which a destination constraint can forbid even
+    /// though the key is served.
+    fn may_manage(&self, store: &Store, key_blob: &[u8], connection: &Connection) -> bool {
+        permitted(&self.constraints_of(store, key_blob), connection)
     }
 
     /// Drop every identity: the backends', the keys added with
-    /// `ssh-add FILE` and every certificate. Backs `ssh-add -D`.
+    /// `ssh-add FILE` and every certificate. Backs `ssh-add -D`, whose
+    /// [`Lifecycle::cleared`] hooks are called once the turn is given up.
     fn remove_all(&self) {
         for backend in &self.backends {
             backend.remove_all();
         }
         self.write(Store::clear);
-        self.lifecycle.iter().for_each(|hook| hook.cleared());
     }
 
     /// Sign `data` with the key `key_blob` names, as a sign request on
@@ -2693,20 +2807,32 @@ mod tests {
         assert_eq!(Agent::new().handle(&add), wire::failure());
     }
 
-    /// A smartcard provider whose key lookup waits, as on a PIN prompt, until
-    /// told to go on.
+    /// A smartcard provider that waits, as on a PIN prompt, until told to
+    /// go on: in its key lookup, before the change takes its turn, or with
+    /// `in_add` in serving the key, while the change holds it.
     struct Prompting {
         key: SignerRef,
+        in_add: bool,
         prompted: Mutex<std::sync::mpsc::Sender<()>>,
         answer: Mutex<std::sync::mpsc::Receiver<()>>,
     }
-    impl SmartcardProvider for Prompting {
-        fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+    impl Prompting {
+        fn prompt(&self) {
             let _ = self.prompted.lock().unwrap().send(());
             let _ = self.answer.lock().unwrap().recv();
+        }
+    }
+    impl SmartcardProvider for Prompting {
+        fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+            if !self.in_add {
+                self.prompt();
+            }
             Ok(self.key.clone())
         }
         fn add(&self, _: &[u8], _: &Zeroizing<Vec<u8>>, _: Option<u32>) -> Result<(), BoxError> {
+            if self.in_add {
+                self.prompt();
+            }
             Ok(())
         }
         fn remove(&self, _: &[u8]) -> Result<crate::Removed, BoxError> {
@@ -2716,7 +2842,9 @@ mod tests {
 
     /// An agent with a [`Prompting`] provider, the `ssh-add -s` request for
     /// its key, word of the prompt starting, and the answer that ends it.
-    fn prompting_agent() -> (
+    fn prompting_agent(
+        in_add: bool,
+    ) -> (
         Arc<Agent>,
         Vec<u8>,
         std::sync::mpsc::Receiver<()>,
@@ -2726,6 +2854,7 @@ mod tests {
         let (answer, answered) = std::sync::mpsc::channel();
         let provider = Prompting {
             key: ed25519(0x2a, "card"),
+            in_add,
             prompted: Mutex::new(prompted),
             answer: Mutex::new(answered),
         };
@@ -2741,7 +2870,7 @@ mod tests {
     #[test]
     fn reads_do_not_wait_for_a_key_change() {
         use std::sync::mpsc;
-        let (agent, add_card, prompt, answer) = prompting_agent();
+        let (agent, add_card, prompt, answer) = prompting_agent(true);
         let (add, public) = local_key(0x2b, "held@example.com");
         assert_eq!(agent.handle(&add), wire::success());
 
@@ -2775,7 +2904,7 @@ mod tests {
     /// prompt, is refused if the agent was locked meanwhile.
     #[test]
     fn a_waiting_key_change_is_refused_once_locked() {
-        let (agent, add_card, prompt, answer) = prompting_agent();
+        let (agent, add_card, prompt, answer) = prompting_agent(true);
         let (add, _) = local_key(0x2c, "held@example.com");
         assert_eq!(agent.handle(&add), wire::success());
 
@@ -2800,6 +2929,37 @@ mod tests {
             1,
             "a locked agent's keys were removed"
         );
+    }
+
+    /// Other connections' key changes go on while one waits for a PIN in
+    /// its key lookup, which runs before the change takes its turn.
+    #[test]
+    fn key_changes_do_not_wait_for_a_pin_prompt() {
+        let (agent, add_card, prompt, answer) = prompting_agent(false);
+        let (add, _) = local_key(0x2d, "held@example.com");
+        let prompting = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || agent.handle(&add_card))
+        };
+        prompt.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (done, replies) = std::sync::mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let added = agent.handle(&add);
+                let removed = agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]);
+                let _ = done.send((added, removed));
+            });
+        }
+        let replies = replies.recv_timeout(Duration::from_secs(5));
+        answer.send(()).unwrap();
+        assert_eq!(
+            replies,
+            Ok((wire::success(), wire::success())),
+            "a key change waited for another's PIN prompt"
+        );
+        assert_eq!(prompting.join().unwrap(), wire::success());
     }
 
     /// `allow_manage` sees each change with its key: the key to add and its
@@ -3238,7 +3398,7 @@ mod tests {
                 Some(certs),
                 &Connection::default(),
             );
-            assert!(matches!(added, Err(AgentError::UnknownKey)));
+            assert!(matches!(added, Err(Some(AgentError::UnknownKey))));
             assert!(agent.snapshot().cert(cert.blob()).is_none());
         }
     }
@@ -3370,5 +3530,193 @@ mod tests {
             after.cert(cert.blob()).is_none() && after.provider_meta(&key.key_blob()).is_none()
         );
         assert!(after.provider.is_empty());
+    }
+
+    /// A key change asked for, on the same thread, from a callback the
+    /// agent calls while committing a change (a backend's or provider's
+    /// `add`, `remove` or `remove_all`) is refused rather than waiting on
+    /// itself.
+    #[test]
+    fn a_key_change_from_inside_a_commit_is_refused() {
+        struct Reenters {
+            key: SignerRef,
+            keys: crate::testing::MemoryBackend,
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            replies: Mutex<Vec<(&'static str, Vec<u8>)>>,
+        }
+        impl Reenters {
+            fn reenter(&self, from: &'static str) {
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                let (add, _) = local_key(0x39, "inner@example.com");
+                self.replies
+                    .lock()
+                    .unwrap()
+                    .push((from, agent.handle(&add)));
+            }
+        }
+        impl SmartcardProvider for Reenters {
+            fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+                Ok(self.key.clone())
+            }
+            fn add(
+                &self,
+                _: &[u8],
+                _: &Zeroizing<Vec<u8>>,
+                _: Option<u32>,
+            ) -> Result<(), BoxError> {
+                self.reenter("SmartcardProvider::add");
+                *self.keys.0.lock().unwrap() = vec![self.key.clone()];
+                Ok(())
+            }
+            fn remove(&self, _: &[u8]) -> Result<crate::Removed, BoxError> {
+                self.reenter("SmartcardProvider::remove");
+                Ok(crate::Removed {
+                    served: Backend::remove(&self.keys, &self.key.key_blob()),
+                    key_blob: Some(self.key.key_blob()),
+                })
+            }
+        }
+        impl Backend for Reenters {
+            fn identities(&self) -> Vec<SignerRef> {
+                self.keys.identities()
+            }
+            fn remove(&self, key_blob: &[u8]) -> bool {
+                self.reenter("Backend::remove");
+                Backend::remove(&self.keys, key_blob)
+            }
+            fn remove_all(&self) {
+                self.reenter("Backend::remove_all");
+                self.keys.remove_all();
+            }
+        }
+
+        let key = ed25519(0x3a, "card");
+        let reenters = Arc::new(Reenters {
+            key: key.clone(),
+            keys: crate::testing::MemoryBackend::new([]),
+            agent: std::sync::OnceLock::new(),
+            replies: Mutex::default(),
+        });
+        let agent = Arc::new(
+            Agent::new()
+                .with_backend(Arc::clone(&reenters) as _)
+                .with_smartcard(Arc::clone(&reenters) as _),
+        );
+        let _ = reenters.agent.set(Arc::downgrade(&agent));
+        let provider_request = |kind: u8| {
+            let mut body = vec![kind];
+            b"card".as_slice().encode(&mut body).unwrap();
+            b"".as_slice().encode(&mut body).unwrap();
+            body
+        };
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        key.key_blob().encode(&mut remove).unwrap();
+        let requests = [
+            provider_request(wire::SSH_AGENTC_ADD_SMARTCARD_KEY),
+            remove,
+            provider_request(wire::SSH_AGENTC_ADD_SMARTCARD_KEY),
+            provider_request(wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY),
+            vec![wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES],
+        ];
+
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let replies: Vec<_> = requests.iter().map(|r| agent.handle(r)).collect();
+                let _ = done.send(replies);
+            });
+        }
+        let outer = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a key change from inside a commit deadlocked");
+        assert!(outer.iter().all(|reply| *reply == wire::success()));
+        let inner = reenters.replies.lock().unwrap().clone();
+        let from: Vec<_> = inner.iter().map(|(from, _)| *from).collect();
+        assert_eq!(
+            from,
+            [
+                "SmartcardProvider::add",
+                "Backend::remove",
+                "SmartcardProvider::add",
+                "SmartcardProvider::remove",
+                "Backend::remove_all",
+            ]
+        );
+        for (from, reply) in inner {
+            assert_eq!(reply, wire::failure(), "{from} was let through");
+        }
+    }
+
+    /// The policy's `allow_manage` and the `cleared` hook run outside any
+    /// commit, so a key change they ask for goes through.
+    #[test]
+    fn a_key_change_from_the_policy_or_a_hook_goes_through() {
+        struct Reenters {
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            /// Set once the policy has asked for its change: a policy that
+            /// changed keys every time it was asked would send its own
+            /// change round until refused.
+            asked: std::sync::atomic::AtomicBool,
+            replies: Mutex<Vec<(&'static str, Vec<u8>)>>,
+        }
+        impl Reenters {
+            fn reenter(&self, from: &'static str, seed: u8) {
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                let (add, _) = local_key(seed, "inner@example.com");
+                self.replies
+                    .lock()
+                    .unwrap()
+                    .push((from, agent.handle(&add)));
+            }
+        }
+        impl Policy for Reenters {
+            fn allow_manage(&self, request: &ManageInfo<'_>) -> bool {
+                if matches!(request.change, KeyChange::RemoveAll)
+                    && !self.asked.swap(true, Ordering::SeqCst)
+                {
+                    self.reenter("Policy::allow_manage", 0x3b);
+                }
+                true
+            }
+        }
+        impl Lifecycle for Reenters {
+            fn cleared(&self) {
+                self.reenter("Lifecycle::cleared", 0x3c);
+            }
+        }
+
+        let reenters = Arc::new(Reenters {
+            agent: std::sync::OnceLock::new(),
+            asked: Default::default(),
+            replies: Mutex::default(),
+        });
+        let agent = Arc::new(
+            Agent::new()
+                .with_policy(Arc::clone(&reenters) as _)
+                .with_lifecycle(Arc::clone(&reenters) as _),
+        );
+        let _ = reenters.agent.set(Arc::downgrade(&agent));
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let _ = done.send(agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]));
+            });
+        }
+        let outer = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a key change from the policy or a hook deadlocked");
+        assert_eq!(outer, wire::success());
+        let inner = reenters.replies.lock().unwrap().clone();
+        assert_eq!(
+            inner,
+            [
+                ("Policy::allow_manage", wire::success()),
+                ("Lifecycle::cleared", wire::success()),
+            ]
+        );
+        // The policy's key went with `ssh-add -D`; the hook's came after.
+        assert_eq!(agent.public_keys().len(), 1);
     }
 }
