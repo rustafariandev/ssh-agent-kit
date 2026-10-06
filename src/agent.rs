@@ -1002,9 +1002,7 @@ impl Agent {
                 .bindings()
                 .last()
                 .ok_or(AgentError::DestinationRefused)?;
-            let expected = PublicKey::from_bytes(requested_blob)
-                .map_err(|_| AgentError::DestinationRefused)?;
-            let userauth = destination::parse_userauth_request(data, &expected)
+            let userauth = destination::parse_userauth_request_for(data, requested_blob)
                 .ok_or(AgentError::UnidentifiedSignature)?;
             let forwarded = connection.bindings().len() > 1 && userauth.hostkey.is_none();
             let mismatch = userauth
@@ -1281,6 +1279,84 @@ mod tests {
         assert!(matches!(
             agent.sign(&key.key_blob(), b"data", 0, &Connection::default()),
             Err(AgentError::Backend(_))
+        ));
+    }
+
+    /// A certificate signs under its key's `ssh-add -h` constraint, as the
+    /// plain key does: the userauth request names it by its own blob.
+    #[test]
+    fn a_destination_constrained_certificate_signs() {
+        use crate::destination::{ConstraintHop, HostKeySpec};
+        use ssh_key::PrivateKey;
+        use ssh_key::private::Ed25519Keypair;
+
+        let host = PrivateKey::from(Ed25519Keypair::from_seed(&[2; 32]));
+        let key = ed25519(1, "ferris@example.com");
+        let cert = crate::testing::certify(key.public_key().key_data());
+        let agent = Agent::new();
+        agent.add_key(key.clone(), None);
+        agent.add_cert_key(key.clone(), cert.clone(), None);
+        agent.set_meta(
+            key.key_blob(),
+            KeyMeta {
+                confirm: false,
+                destination: vec![DestinationConstraint {
+                    from: ConstraintHop {
+                        username: None,
+                        hostname: None,
+                        hostkeys: Vec::new(),
+                    },
+                    to: ConstraintHop {
+                        username: None,
+                        hostname: Some("example.com".into()),
+                        hostkeys: vec![HostKeySpec {
+                            key: host.public_key().clone(),
+                            is_ca: false,
+                        }],
+                    },
+                }],
+            },
+        );
+
+        let session_id = b"session";
+        let mut signature = Vec::new();
+        signature::Signer::sign(&host, session_id)
+            .encode(&mut signature)
+            .unwrap();
+        let mut connection = Connection::default();
+        connection
+            .bind(host.public_key().clone(), session_id, &signature, false)
+            .unwrap();
+
+        let userauth = |algorithm: &str, blob: &[u8]| {
+            let mut data = Vec::new();
+            session_id.as_slice().encode(&mut data).unwrap();
+            data.push(50);
+            "ferris".encode(&mut data).unwrap();
+            "ssh-connection".encode(&mut data).unwrap();
+            "publickey".encode(&mut data).unwrap();
+            data.push(1);
+            algorithm.encode(&mut data).unwrap();
+            blob.encode(&mut data).unwrap();
+            data
+        };
+        let for_cert = userauth("ssh-ed25519-cert-v01@openssh.com", cert.blob());
+        let for_key = userauth("ssh-ed25519", &key.key_blob());
+        assert!(agent.sign(cert.blob(), &for_cert, 0, &connection).is_ok());
+        assert!(
+            agent
+                .sign(&key.key_blob(), &for_key, 0, &connection)
+                .is_ok()
+        );
+        // The request must be for the identity asked to sign it.
+        assert!(matches!(
+            agent.sign(cert.blob(), &for_key, 0, &connection),
+            Err(AgentError::UnidentifiedSignature)
+        ));
+        // An unbound connection still gets nothing from a constrained key.
+        assert!(matches!(
+            agent.sign(cert.blob(), &for_cert, 0, &Connection::default()),
+            Err(AgentError::DestinationRefused)
         ));
     }
 

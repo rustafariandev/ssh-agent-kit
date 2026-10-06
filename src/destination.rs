@@ -392,7 +392,14 @@ const METHOD_PUBLICKEY_HOSTBOUND: &str = "publickey-hostbound-v00@openssh.com";
 
 /// Parse `data` as a publickey userauth request for `expected`, as OpenSSH's
 /// `parse_userauth_request`. Returns `None` for anything else.
-pub fn parse_userauth_request(mut data: &[u8], expected: &PublicKey) -> Option<Userauth> {
+pub fn parse_userauth_request(data: &[u8], expected: &PublicKey) -> Option<Userauth> {
+    parse_userauth_request_for(data, &expected.to_bytes().ok()?)
+}
+
+/// As [`parse_userauth_request`], for the key or certificate whose wire blob
+/// is `expected`: a sign request names a certificate by its blob, and the
+/// userauth request it signs carries that same blob.
+pub fn parse_userauth_request_for(mut data: &[u8], expected: &[u8]) -> Option<Userauth> {
     let session_id = Vec::<u8>::decode(&mut data).ok()?;
     if session_id.is_empty() {
         return None;
@@ -406,8 +413,7 @@ pub fn parse_userauth_request(mut data: &[u8], expected: &PublicKey) -> Option<U
     let sig_follows = u8::decode(&mut data).ok()?;
     let _pkalg = String::decode(&mut data).ok()?;
     let blob = Vec::<u8>::decode(&mut data).ok()?;
-    let key = PublicKey::from_bytes(&blob).ok()?;
-    if sig_follows != 1 || service != "ssh-connection" || key.key_data() != expected.key_data() {
+    if sig_follows != 1 || service != "ssh-connection" || blob != expected {
         return None;
     }
     let hostkey = if method == METHOD_PUBLICKEY_HOSTBOUND {
