@@ -31,6 +31,13 @@ follows [Semantic Versioning](https://semver.org/).
   them as soon as it started, so the key signed under them while the
   provider asked for a PIN, and kept them if the add failed. They now
   change only once the add succeeds.
+- `ssh-add -C -s` without `-c`/`-h`, adding certificates alone to a key
+  served under constraints, replaced the key's constraints, so the key and
+  its certificates signed without them. Such certificates now take the
+  key's constraints, and the key keeps them.
+- A backend that dropped an `ssh-add -s -c`/`-h` key while its
+  certificates were being added left them served without its constraints.
+  They are now refused with it.
 - A key change that waited for another connection's, such as one held up
   by a PIN prompt, still ran if the agent was locked meanwhile. It is now
   refused.
@@ -44,8 +51,10 @@ follows [Semantic Versioning](https://semver.org/).
 - Listing and signing no longer wait on key changes: they read an immutable
   snapshot of the added keys, certificates and constraints, which each
   change replaces with a changed copy. Extensions and key types are
-  registered the same way. Expired keys are skipped by reads and dropped
-  by the next change or by the server's once-a-second tick.
+  registered the same way. Each certificate is kept with the key that
+  signs for it, so a key and what was attached to it come and go together.
+  Expired keys are dropped, and their secrets freed, by the first read or
+  change after they expire.
 - Every `Backend` method, not only `remove` and `remove_all`, is documented
   as possibly called while key changes are taken one at a time, since a key
   change looks up and purges backend keys too.

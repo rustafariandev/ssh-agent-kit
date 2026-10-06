@@ -14,7 +14,6 @@ use crate::wire::{self, Request};
 use arc_swap::ArcSwap;
 use ssh_encoding::Decode;
 use ssh_key::{HashAlg, PublicKey};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
@@ -134,33 +133,86 @@ const MAX_UNLOCK_FAILURES: u32 = 100;
 /// constraints that keep changing under it.
 const LOOKUP_ATTEMPTS: usize = 3;
 
-/// A certificate the agent lists, and the key that signs for it.
-#[derive(Clone)]
-struct CertIdentity {
-    cert: CertKey,
-    comment: String,
-    signer: CertSigner,
+/// A certificate the agent lists, and the key that signs for it, as found
+/// in a [`Store`].
+struct CertIdentity<'a> {
+    cert: &'a CertKey,
+    comment: &'a str,
+    signer: CertSigner<'a>,
 }
 
-#[derive(Clone)]
-enum CertSigner {
+enum CertSigner<'a> {
     /// The private key `ssh-add FILE` sent with the certificate, and the
     /// `ssh-add -c`/`-h` constraints the certificate was added with.
-    Held { key: SignerRef, meta: KeyMeta },
+    Held {
+        key: &'a SignerRef,
+        meta: &'a KeyMeta,
+    },
     /// The key `ssh-add -s PROVIDER CERT…` named; dropped with it, and
     /// constrained as it is.
-    Provider(SignerRef),
+    Provider(&'a SignerRef),
     /// Whichever key a backend serves that the certificate certifies, for a
     /// certificate loaded with [`Agent::with_certificates`].
     Served,
 }
 
-/// A key added with `ssh-add FILE`, with the `ssh-add -c`/`-h` constraints
-/// it was added with.
+/// A key `ssh-add FILE` sent: served as an identity of its own, with
+/// certificates, or both. Each identity keeps the `ssh-add -c`/`-h`
+/// constraints and `ssh-add -t` lifetime it was added with.
 #[derive(Clone)]
-struct HeldKey {
+struct HeldEntry {
     key: SignerRef,
+    /// The plain key's constraints, while it is served as an identity.
+    own: Option<Expiring<KeyMeta>>,
+    certs: Vec<Expiring<HeldCert>>,
+}
+
+#[derive(Clone)]
+struct HeldCert {
+    cert: CertKey,
     meta: KeyMeta,
+}
+
+impl HeldEntry {
+    /// The plain key's constraints, unless it is not served or has expired.
+    fn own(&self) -> Option<&KeyMeta> {
+        self.own.as_ref().filter(|e| !e.expired()).map(|e| &e.item)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.own.is_none() && self.certs.is_empty()
+    }
+}
+
+/// What `ssh-add -s` attached to a backend key: its constraints, recorded
+/// before the key is served and dropped after it goes, and the
+/// certificates it was added with, which share them. The key itself lives
+/// in a backend.
+#[derive(Clone)]
+struct ProviderEntry {
+    key_blob: Vec<u8>,
+    meta: KeyMeta,
+    certs: Vec<Expiring<ProviderCert>>,
+}
+
+#[derive(Clone)]
+struct ProviderCert {
+    cert: CertKey,
+    key: SignerRef,
+}
+
+impl ProviderEntry {
+    fn is_empty(&self) -> bool {
+        self.meta.is_empty() && self.certs.is_empty()
+    }
+}
+
+/// A certificate [`Agent::with_certificates`] serves for a backend key,
+/// listed under `comment`.
+#[derive(Clone)]
+struct ServedCert {
+    cert: CertKey,
+    comment: String,
 }
 
 /// An identity a listing found, before the policy is asked about it.
@@ -180,125 +232,273 @@ enum Constraints {
     Provider(Vec<u8>),
 }
 
-/// The identity for a certificate `ssh-add FILE` sent with its key `key`,
-/// listed under the key's comment and constrained by `meta`.
-fn held_cert(key: SignerRef, cert: CertKey, meta: KeyMeta) -> CertIdentity {
-    let comment = key.comment().to_owned();
-    tracing::info!(
-        comment,
-        key_id = cert.certificate().key_id(),
-        "serving added certificate"
-    );
-    CertIdentity {
-        cert,
-        comment,
-        signer: CertSigner::Held { key, meta },
-    }
-}
-
 /// What the agent holds itself. A published store is never changed: a
 /// write changes a copy (see [`Agent::write`]), so an identity and its
 /// constraints are always seen together. Each collection is shared between
 /// copies until a write changes it, so a copy costs three reference counts.
+///
+/// Certificates are kept with the key that signs for them, so a key and
+/// what was attached to it come and go together; only those
+/// [`Agent::with_certificates`] serves, for keys no entry holds, stand
+/// apart.
 #[derive(Clone, Default)]
 struct Store {
-    /// Keys added at runtime with `ssh-add FILE`, each with its own
-    /// constraints.
-    held: Arc<Vec<Expiring<HeldKey>>>,
-    /// Certificates, each served as an identity of its own.
-    certs: Arc<Vec<Expiring<CertIdentity>>>,
-    /// The `ssh-add -c`/`-h` constraints of keys `ssh-add -s` added, by
-    /// their public key blob, shared with the certificates attached to them
-    /// and those [`Agent::with_certificates`] serves for them. The keys
-    /// themselves live in a backend, so the constraints are recorded before
-    /// the key is served and cleared after it goes. Replaced only when an
-    /// entry changes, so a reader can tell from this `Arc` alone whether
-    /// they changed between two snapshots.
-    provider_meta: Arc<HashMap<Vec<u8>, KeyMeta>>,
+    /// Keys added at runtime with `ssh-add FILE`, with their certificates.
+    held: Arc<Vec<HeldEntry>>,
+    /// What `ssh-add -s` attached to backend keys, one entry per key.
+    /// Replaced only when an entry changes, so a reader can tell from this
+    /// `Arc` alone whether one did between two snapshots.
+    provider: Arc<Vec<ProviderEntry>>,
+    /// Certificates for backend keys, loaded with the agent.
+    served: Arc<Vec<ServedCert>>,
 }
 
 impl Store {
     fn has_expired(&self) -> bool {
-        self.held.iter().any(Expiring::expired) || self.certs.iter().any(Expiring::expired)
+        self.held.iter().any(|e| {
+            e.own.as_ref().is_some_and(Expiring::expired) || e.certs.iter().any(Expiring::expired)
+        }) || self
+            .provider
+            .iter()
+            .any(|e| e.certs.iter().any(Expiring::expired))
     }
 
     /// Drop expired keys and certificates, constraints and all.
     fn purge_expired(&mut self) {
-        if self.held.iter().any(Expiring::expired) {
-            Arc::make_mut(&mut self.held).retain(|e| !e.expired());
+        if !self.has_expired() {
+            return;
         }
-        if self.certs.iter().any(Expiring::expired) {
-            Arc::make_mut(&mut self.certs).retain(|e| !e.expired());
+        let held = Arc::make_mut(&mut self.held);
+        for entry in held.iter_mut() {
+            entry.own = entry.own.take().filter(|e| !e.expired());
+            entry.certs.retain(|e| !e.expired());
         }
+        held.retain(|e| !e.is_empty());
+        let provider = Arc::make_mut(&mut self.provider);
+        for entry in provider.iter_mut() {
+            entry.certs.retain(|e| !e.expired());
+        }
+        provider.retain(|e| !e.is_empty());
     }
 
-    /// The added key `key_blob` names, unless it has expired.
-    fn held_key(&self, key_blob: &[u8]) -> Option<&HeldKey> {
+    fn held_entry(&self, key_blob: &[u8]) -> Option<&HeldEntry> {
+        self.held.iter().find(|e| e.key.key_blob() == key_blob)
+    }
+
+    /// The added key `key_blob` names and its constraints, unless it is not
+    /// served as an identity of its own or has expired.
+    fn held_key(&self, key_blob: &[u8]) -> Option<(&SignerRef, &KeyMeta)> {
+        let entry = self.held_entry(key_blob)?;
+        entry.own().map(|meta| (&entry.key, meta))
+    }
+
+    /// Every added key served as an identity of its own, in the order added.
+    fn held_keys(&self) -> impl Iterator<Item = (&SignerRef, &KeyMeta)> {
         self.held
             .iter()
-            .find(|e| e.item.key.key_blob() == key_blob && !e.expired())
-            .map(|e| &e.item)
+            .filter_map(|e| e.own().map(|meta| (&e.key, meta)))
+    }
+
+    /// Every certificate served, unless its `ssh-add -t` lifetime has run
+    /// out: those added with their key, then those `ssh-add -s` attached,
+    /// then those loaded with the agent.
+    fn certs(&self) -> impl Iterator<Item = CertIdentity<'_>> {
+        let held = self.held.iter().flat_map(|entry| {
+            entry
+                .certs
+                .iter()
+                .filter(|e| !e.expired())
+                .map(|e| CertIdentity {
+                    cert: &e.item.cert,
+                    comment: entry.key.comment(),
+                    signer: CertSigner::Held {
+                        key: &entry.key,
+                        meta: &e.item.meta,
+                    },
+                })
+        });
+        let provider = self.provider.iter().flat_map(|entry| {
+            entry
+                .certs
+                .iter()
+                .filter(|e| !e.expired())
+                .map(|e| CertIdentity {
+                    cert: &e.item.cert,
+                    comment: e.item.key.comment(),
+                    signer: CertSigner::Provider(&e.item.key),
+                })
+        });
+        let served = self.served.iter().map(|c| CertIdentity {
+            cert: &c.cert,
+            comment: &c.comment,
+            signer: CertSigner::Served,
+        });
+        held.chain(provider).chain(served)
     }
 
     /// The certificate whose blob is `blob`, unless its `ssh-add -t`
     /// lifetime has run out.
-    fn cert(&self, blob: &[u8]) -> Option<&CertIdentity> {
-        self.certs
-            .iter()
-            .find(|e| e.item.cert.blob() == blob && !e.expired())
-            .map(|e| &e.item)
+    fn cert(&self, blob: &[u8]) -> Option<CertIdentity<'_>> {
+        self.certs().find(|c| c.cert.blob() == blob)
     }
 
-    /// Serve `held`, replacing the same key, and its constraints, if it is
-    /// already served.
-    fn hold(&mut self, held: HeldKey, lifetime: Option<u32>) {
-        let blob = held.key.key_blob();
-        let keys = Arc::make_mut(&mut self.held);
-        keys.retain(|e| e.item.key.key_blob() != blob);
-        keys.push(Expiring::new(held, lifetime));
+    /// Serve `key` as an identity of its own under `meta`, replacing its
+    /// constraints and lifetime if it is already served. Its certificates
+    /// keep theirs.
+    fn hold(&mut self, key: SignerRef, meta: KeyMeta, lifetime: Option<u32>) {
+        let own = Some(Expiring::new(meta, lifetime));
+        let blob = key.key_blob();
+        let held = Arc::make_mut(&mut self.held);
+        match held.iter_mut().find(|e| e.key.key_blob() == blob) {
+            Some(entry) => {
+                entry.key = key;
+                entry.own = own;
+            }
+            None => held.push(HeldEntry {
+                key,
+                own,
+                certs: Vec::new(),
+            }),
+        }
     }
 
-    fn push_cert(&mut self, identity: CertIdentity, lifetime: Option<u32>) {
-        let certs = Arc::make_mut(&mut self.certs);
-        certs.retain(|e| e.item.cert.blob() != identity.cert.blob());
-        certs.push(Expiring::new(identity, lifetime));
+    /// Serve `cert`, signed for by `key`, under `meta`, replacing the same
+    /// certificate wherever it is served.
+    fn hold_cert(&mut self, key: SignerRef, cert: CertKey, meta: KeyMeta, lifetime: Option<u32>) {
+        self.take_cert(cert.blob());
+        let added = Expiring::new(HeldCert { cert, meta }, lifetime);
+        let blob = key.key_blob();
+        let held = Arc::make_mut(&mut self.held);
+        match held.iter_mut().find(|e| e.key.key_blob() == blob) {
+            Some(entry) => entry.certs.push(added),
+            None => held.push(HeldEntry {
+                key,
+                own: None,
+                certs: vec![added],
+            }),
+        }
     }
 
+    /// Stop serving the added key `key_blob` as an identity of its own. Its
+    /// certificates stay. Returns whether it was served.
     fn remove_held(&mut self, key_blob: &[u8]) -> bool {
-        if !self.held.iter().any(|e| e.item.key.key_blob() == key_blob) {
+        if self.held_entry(key_blob).is_none_or(|e| e.own.is_none()) {
             return false;
         }
-        Arc::make_mut(&mut self.held).retain(|e| e.item.key.key_blob() != key_blob);
+        let held = Arc::make_mut(&mut self.held);
+        held.iter_mut()
+            .filter(|e| e.key.key_blob() == key_blob)
+            .for_each(|e| e.own = None);
+        held.retain(|e| !e.is_empty());
         true
     }
 
-    fn take_cert(&mut self, blob: &[u8]) -> Option<CertIdentity> {
-        let at = self.certs.iter().position(|e| e.item.cert.blob() == blob)?;
-        Some(Arc::make_mut(&mut self.certs).remove(at).item)
+    /// Stop serving the certificate whose blob is `blob`, wherever it is
+    /// kept. Returns whether it was served.
+    fn take_cert(&mut self, blob: &[u8]) -> bool {
+        if self
+            .held
+            .iter()
+            .any(|e| e.certs.iter().any(|c| c.item.cert.blob() == blob))
+        {
+            let held = Arc::make_mut(&mut self.held);
+            held.iter_mut()
+                .for_each(|e| e.certs.retain(|c| c.item.cert.blob() != blob));
+            held.retain(|e| !e.is_empty());
+            return true;
+        }
+        if self
+            .provider
+            .iter()
+            .any(|e| e.certs.iter().any(|c| c.item.cert.blob() == blob))
+        {
+            let provider = Arc::make_mut(&mut self.provider);
+            provider
+                .iter_mut()
+                .for_each(|e| e.certs.retain(|c| c.item.cert.blob() != blob));
+            provider.retain(|e| !e.is_empty());
+            return true;
+        }
+        if self.served.iter().any(|c| c.cert.blob() == blob) {
+            Arc::make_mut(&mut self.served).retain(|c| c.cert.blob() != blob);
+            return true;
+        }
+        false
     }
 
-    fn remove_provider_certs(&mut self, key_blob: &[u8]) -> bool {
-        let attached = |e: &Expiring<CertIdentity>| matches!(&e.item.signer, CertSigner::Provider(key) if key.key_blob() == key_blob);
-        if !self.certs.iter().any(attached) {
+    fn provider_entry(&self, key_blob: &[u8]) -> Option<&ProviderEntry> {
+        self.provider.iter().find(|e| e.key_blob == key_blob)
+    }
+
+    /// The constraints `ssh-add -s` recorded for the key `key_blob`, if any.
+    fn provider_meta(&self, key_blob: &[u8]) -> Option<&KeyMeta> {
+        self.provider_entry(key_blob)
+            .map(|e| &e.meta)
+            .filter(|meta| !meta.is_empty())
+    }
+
+    /// Record or clear the constraints of a key `ssh-add -s` added, which
+    /// its certificates share.
+    fn set_provider_meta(&mut self, key_blob: Vec<u8>, meta: KeyMeta) {
+        match self.provider_entry(&key_blob) {
+            Some(entry) if entry.meta == meta => {}
+            Some(_) => {
+                let provider = Arc::make_mut(&mut self.provider);
+                provider
+                    .iter_mut()
+                    .filter(|e| e.key_blob == key_blob)
+                    .for_each(|e| e.meta = meta.clone());
+                provider.retain(|e| !e.is_empty());
+            }
+            None if meta.is_empty() => {}
+            None => Arc::make_mut(&mut self.provider).push(ProviderEntry {
+                key_blob,
+                meta,
+                certs: Vec::new(),
+            }),
+        }
+    }
+
+    /// Serve `certs` for the `ssh-add -s` key `key`, under its constraints,
+    /// replacing each wherever it is served.
+    fn attach_provider_certs(&mut self, key: &SignerRef, certs: &[CertKey], lifetime: Option<u32>) {
+        for cert in certs {
+            self.take_cert(cert.blob());
+        }
+        let attached = certs.iter().map(|cert| {
+            Expiring::new(
+                ProviderCert {
+                    cert: cert.clone(),
+                    key: key.clone(),
+                },
+                lifetime,
+            )
+        });
+        let blob = key.key_blob();
+        let provider = Arc::make_mut(&mut self.provider);
+        match provider.iter_mut().find(|e| e.key_blob == blob) {
+            Some(entry) => entry.certs.extend(attached),
+            None => provider.push(ProviderEntry {
+                key_blob: blob,
+                meta: KeyMeta::default(),
+                certs: attached.collect(),
+            }),
+        }
+    }
+
+    /// Forget what `ssh-add -s` attached to the key `key_blob`, which its
+    /// backend stopped serving: its certificates and, once something was
+    /// removed (`served` says whether the key itself was), its constraints.
+    /// Returns whether any certificate was dropped.
+    fn release(&mut self, key_blob: &[u8], served: bool) -> bool {
+        let Some(entry) = self.provider_entry(key_blob) else {
             return false;
+        };
+        let dropped = !entry.certs.is_empty();
+        if served || dropped {
+            Arc::make_mut(&mut self.provider).retain(|e| e.key_blob != key_blob);
         }
-        Arc::make_mut(&mut self.certs).retain(|e| !attached(e));
-        true
-    }
-
-    /// Record or clear the constraints of a key `ssh-add -s` added.
-    fn set_provider_meta(&mut self, blob: Vec<u8>, meta: KeyMeta) {
-        if meta.is_empty() {
-            self.remove_provider_meta(&blob);
-        } else if self.provider_meta.get(&blob) != Some(&meta) {
-            Arc::make_mut(&mut self.provider_meta).insert(blob, meta);
-        }
-    }
-
-    fn remove_provider_meta(&mut self, key_blob: &[u8]) {
-        if self.provider_meta.contains_key(key_blob) {
-            Arc::make_mut(&mut self.provider_meta).remove(key_blob);
-        }
+        dropped
     }
 
     /// The constraints `constraints` points at, as of this snapshot.
@@ -314,21 +514,16 @@ impl Store {
     /// A backend serving the same key does not lift its `-c`/`-h`.
     fn backend_meta(&self, key_blob: &[u8]) -> KeyMeta {
         match self.held_key(key_blob) {
-            Some(held) => held.meta.clone(),
-            None => self
-                .provider_meta
-                .get(key_blob)
-                .cloned()
-                .unwrap_or_default(),
+            Some((_, meta)) => meta.clone(),
+            None => self.provider_meta(key_blob).cloned().unwrap_or_default(),
         }
     }
 
     /// Whether a backend key's constraints may differ between this snapshot
-    /// and `other`: false only when neither the added keys nor the provider
-    /// constraints were replaced.
+    /// and `other`: false only when neither the added keys nor what
+    /// `ssh-add -s` attached were replaced.
     fn backend_meta_may_differ(&self, other: &Store) -> bool {
-        !(Arc::ptr_eq(&self.provider_meta, &other.provider_meta)
-            && Arc::ptr_eq(&self.held, &other.held))
+        !(Arc::ptr_eq(&self.provider, &other.provider) && Arc::ptr_eq(&self.held, &other.held))
     }
 
     fn clear(&mut self) {
@@ -480,13 +675,18 @@ impl Agent {
     ) {
         match cert {
             Some(cert) => {
-                let identity = held_cert(key, cert, meta);
-                self.write(|store| store.push_cert(identity.clone(), lifetime));
+                tracing::info!(
+                    comment = key.comment(),
+                    key_id = cert.certificate().key_id(),
+                    "serving added certificate"
+                );
+                self.write(|store| {
+                    store.hold_cert(key.clone(), cert.clone(), meta.clone(), lifetime)
+                });
             }
             None => {
                 tracing::info!(comment = key.comment(), "serving added key");
-                let held = HeldKey { key, meta };
-                self.write(|store| store.hold(held.clone(), lifetime));
+                self.write(|store| store.hold(key.clone(), meta.clone(), lifetime));
             }
         }
     }
@@ -495,24 +695,17 @@ impl Agent {
     /// comment (else its key id), while a backend serves a key it certifies
     /// and it has not expired.
     pub fn with_certificates(self, certs: impl IntoIterator<Item = CertKey>) -> Self {
-        let served: Vec<Expiring<CertIdentity>> = certs
+        let served: Vec<ServedCert> = certs
             .into_iter()
             .map(|cert| {
                 let comment = match cert.comment() {
                     "" => cert.certificate().key_id().to_owned(),
                     comment => comment.to_owned(),
                 };
-                Expiring::new(
-                    CertIdentity {
-                        cert,
-                        comment,
-                        signer: CertSigner::Served,
-                    },
-                    None,
-                )
+                ServedCert { cert, comment }
             })
             .collect();
-        self.write(|store| Arc::make_mut(&mut store.certs).extend(served.iter().cloned()));
+        self.write(|store| Arc::make_mut(&mut store.served).extend(served.iter().cloned()));
         self
     }
 
@@ -527,7 +720,7 @@ impl Agent {
     /// Stop serving the certificate whose blob is `blob`. Returns whether
     /// anything was removed.
     pub fn remove_cert(&self, blob: &[u8]) -> bool {
-        self.write(|store| store.take_cert(blob).is_some())
+        self.write(|store| store.take_cert(blob))
     }
 
     /// Forget what the agent attached to a backend key that its backend
@@ -536,13 +729,7 @@ impl Agent {
     /// itself was), its `ssh-add -c`/`-h` constraints. Returns whether any
     /// certificate was dropped.
     pub fn release(&self, key_blob: &[u8], served: bool) -> bool {
-        self.write(|store| {
-            let dropped = store.remove_provider_certs(key_blob);
-            if served || dropped {
-                store.remove_provider_meta(key_blob);
-            }
-            dropped
-        })
+        self.write(|store| store.release(key_blob, served))
     }
 
     /// Stop serving the key added with `ssh-add FILE` whose public key blob is
@@ -575,12 +762,10 @@ impl Agent {
     }
 
     /// Drop identities whose lifetime has elapsed, in the backends too.
-    /// Reads skip expired identities on their own; this frees them.
+    /// Every read drops the agent's own expired identities as well.
     pub fn purge_expired(&self) {
         self.purge_backends();
-        if self.snapshot().has_expired() {
-            self.write(|_| ());
-        }
+        self.snapshot();
     }
 
     fn purge_backends(&self) {
@@ -590,7 +775,14 @@ impl Agent {
     }
 
     /// The store as it is now. It never changes, however many writes follow.
+    /// One holding expired identities is replaced by a copy without them
+    /// first, so their secrets are freed as soon as anything reads.
     fn snapshot(&self) -> Arc<Store> {
+        let current = self.store.load_full();
+        if !current.has_expired() {
+            return current;
+        }
+        self.write(|_| ());
         self.store.load_full()
     }
 
@@ -622,10 +814,8 @@ impl Agent {
             .collect();
         keys.extend(
             self.snapshot()
-                .held
-                .iter()
-                .filter(|e| !e.expired())
-                .map(|e| e.item.key.public_key().clone()),
+                .held_keys()
+                .map(|(key, _)| key.public_key().clone()),
         );
         keys
     }
@@ -696,16 +886,16 @@ impl Agent {
                 });
             }
         }
-        for held in store.held.iter().filter(|e| !e.expired()).map(|e| &e.item) {
-            if permitted(&held.meta, connection) {
+        for (key, meta) in store.held_keys() {
+            if permitted(meta, connection) {
                 out.push(Listing {
-                    listed: wire::listed(held.key.public_key()),
-                    key: held.key.clone(),
+                    listed: wire::listed(key.public_key()),
+                    key: key.clone(),
                     cert: None,
                 });
             }
         }
-        for identity in store.certs.iter().filter(|e| !e.expired()).map(|e| &e.item) {
+        for identity in store.certs() {
             if identity.cert.expired() {
                 tracing::debug!(
                     key_id = identity.cert.certificate().key_id(),
@@ -713,7 +903,7 @@ impl Agent {
                 );
                 continue;
             }
-            let Some((signer, constraints)) = self.cert_signer(identity) else {
+            let Some((signer, constraints)) = self.cert_signer(&identity) else {
                 continue;
             };
             if let Constraints::Provider(blob) = &constraints {
@@ -721,7 +911,7 @@ impl Agent {
             }
             if permitted(&store.resolve(constraints), connection) {
                 out.push(Listing {
-                    listed: (identity.cert.blob().to_vec(), identity.comment.clone()),
+                    listed: (identity.cert.blob().to_vec(), identity.comment.to_owned()),
                     key: signer,
                     cert: Some(identity.cert.clone()),
                 });
@@ -753,19 +943,22 @@ impl Agent {
     /// Certificates served for `key`, a backend or added key.
     pub fn certificates_for(&self, key: &PublicKey) -> Vec<CertKey> {
         self.snapshot()
-            .certs
-            .iter()
-            .filter(|e| e.item.cert.certifies(key) && !e.item.cert.expired() && !e.expired())
-            .map(|e| e.item.cert.clone())
+            .certs()
+            .filter(|c| c.cert.certifies(key) && !c.cert.expired())
+            .map(|c| c.cert.clone())
             .collect()
     }
 
     /// The key that signs for a certificate, if it is served, and where the
     /// certificate's constraints are kept.
-    fn cert_signer(&self, identity: &CertIdentity) -> Option<(SignerRef, Constraints)> {
-        match &identity.signer {
-            CertSigner::Held { key, meta } => Some((key.clone(), Constraints::Own(meta.clone()))),
-            CertSigner::Provider(key) => Some((key.clone(), Constraints::Provider(key.key_blob()))),
+    fn cert_signer(&self, identity: &CertIdentity<'_>) -> Option<(SignerRef, Constraints)> {
+        match identity.signer {
+            CertSigner::Held { key, meta } => {
+                Some(((*key).clone(), Constraints::Own(meta.clone())))
+            }
+            CertSigner::Provider(key) => {
+                Some(((*key).clone(), Constraints::Provider(key.key_blob())))
+            }
             CertSigner::Served => self
                 .backends
                 .iter()
@@ -953,7 +1146,7 @@ impl Agent {
                 let removed = self.write(|store| {
                     if store.remove_held(&key_blob) {
                         Some("removed added key")
-                    } else if store.take_cert(&key_blob).is_some() {
+                    } else if store.take_cert(&key_blob) {
                         Some("removed certificate")
                     } else {
                         None
@@ -1062,7 +1255,23 @@ impl Agent {
         self.purge_backends();
         // Fetch the key first: its blob names the constraints.
         let key = source.resolve(provider, pin).map_err(AgentError::Backend)?;
+        let blob = key.key_blob();
         let certs_only = certs.as_ref().is_some_and(|c| c.certs_only);
+        // `ssh-add -C` adds certificates alone: for a key served under
+        // constraints they share those, rather than replace them for the
+        // key and every certificate it already has.
+        let meta = match self.snapshot().provider_meta(&blob) {
+            Some(current) if certs_only && self.backend_key(&blob).is_some() => {
+                if *current != meta {
+                    tracing::info!(
+                        key = key.comment(),
+                        "certificates take the served key's constraints"
+                    );
+                }
+                current.clone()
+            }
+            _ => meta,
+        };
         let change = KeyChange::AddProvider {
             provider,
             key: key.public_key(),
@@ -1097,7 +1306,7 @@ impl Agent {
             }
             None => Vec::new(),
         };
-        self.publish_constrained(key.key_blob(), meta, || {
+        self.publish_constrained(blob.clone(), meta.clone(), || {
             if !certs_only {
                 source
                     .add(provider, pin, lifetime)
@@ -1105,20 +1314,32 @@ impl Agent {
             }
             Ok(())
         })?;
+        if matching.is_empty() {
+            return Ok(());
+        }
         // Once the key's constraints are in place, so a certificate is never
-        // served under the ones it had before.
-        for cert in matching {
+        // served under the ones it had before, and only while they are: a
+        // backend that released the key meanwhile took them with it.
+        let attached = self.write(|store| {
+            if !meta.is_empty() && store.provider_meta(&blob) != Some(&meta) {
+                return false;
+            }
+            store.attach_provider_certs(&key, &matching, lifetime);
+            true
+        });
+        if !attached {
+            tracing::warn!(
+                key = key.comment(),
+                "key released while its certificates were added"
+            );
+            return Err(AgentError::UnknownKey);
+        }
+        for cert in &matching {
             tracing::info!(
                 key = key.comment(),
                 key_id = cert.certificate().key_id(),
                 "serving certificate"
             );
-            let identity = CertIdentity {
-                cert,
-                comment: key.comment().to_owned(),
-                signer: CertSigner::Provider(key.clone()),
-            };
-            self.write(|store| store.push_cert(identity.clone(), lifetime));
         }
         Ok(())
     }
@@ -1216,11 +1437,11 @@ impl Agent {
     /// not: a key `ssh-add -s` added keeps them before it is served. Only a
     /// certificate [`Self::with_certificates`] serves asks the backends.
     fn constraints_of(&self, store: &Store, key_blob: &[u8]) -> KeyMeta {
-        let constraints = if let Some(held) = store.held_key(key_blob) {
-            Constraints::Own(held.meta.clone())
+        let constraints = if let Some((_, meta)) = store.held_key(key_blob) {
+            Constraints::Own(meta.clone())
         } else if let Some((_, constraints)) = store
             .cert(key_blob)
-            .and_then(|identity| self.cert_signer(identity))
+            .and_then(|identity| self.cert_signer(&identity))
         {
             constraints
         } else {
@@ -1251,7 +1472,7 @@ impl Agent {
     ) -> Result<T, AgentError> {
         let served = self.backend_key(&blob).is_some();
         let (previous, deferred) = self.write(|store| {
-            let previous = store.provider_meta.get(&blob).cloned();
+            let previous = store.provider_meta(&blob).cloned();
             let deferred = served && previous.is_some();
             if !deferred {
                 store.set_provider_meta(blob.clone(), meta.clone());
@@ -1267,7 +1488,7 @@ impl Agent {
             let ours = (!meta.is_empty()).then_some(&meta);
             let previous = previous.unwrap_or_default();
             self.write(|store| {
-                if store.provider_meta.get(&blob) == ours {
+                if store.provider_meta(&blob) == ours {
                     store.set_provider_meta(blob.clone(), previous.clone());
                 }
             });
@@ -1427,8 +1648,8 @@ impl Agent {
         if let Some(key) = self.backend_key(key_blob) {
             return Ok((key, Constraints::Provider(key_blob.to_vec())));
         }
-        if let Some(held) = store.held_key(key_blob) {
-            return Ok((held.key.clone(), Constraints::Own(held.meta.clone())));
+        if let Some((key, meta)) = store.held_key(key_blob) {
+            return Ok((key.clone(), Constraints::Own(meta.clone())));
         }
         match store.cert(key_blob) {
             Some(identity) if identity.cert.expired() => {
@@ -1438,7 +1659,7 @@ impl Agent {
                 );
                 Err(AgentError::UnknownKey)
             }
-            Some(identity) => self.cert_signer(identity).ok_or(AgentError::UnknownKey),
+            Some(identity) => self.cert_signer(&identity).ok_or(AgentError::UnknownKey),
             None => Err(AgentError::UnknownKey),
         }
     }
@@ -1470,6 +1691,13 @@ mod tests {
     use ssh_encoding::Encode;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
+
+    /// Make the added key at `index` in `store` expire now, as if its
+    /// `ssh-add -t` lifetime had run out.
+    fn expire_own(store: &mut Store, index: usize) {
+        let own = Arc::make_mut(&mut store.held)[index].own.as_mut();
+        own.expect("the key is served").expires = Some(Instant::now());
+    }
 
     fn local_key(seed: u8, comment: &str) -> (Vec<u8>, PublicKey) {
         use ssh_key::private::Ed25519Keypair;
@@ -1555,15 +1783,13 @@ mod tests {
         assert_eq!(agent.handle(&constrained), wire::success());
         assert_eq!(agent.public_keys().len(), 1);
 
+        let blob = agent.snapshot().held[0].key.key_blob();
         // Pretend the lifetime elapsed.
-        agent.write(|store| Arc::make_mut(&mut store.held)[0].expires = Some(Instant::now()));
-        assert!(agent.public_keys().is_empty());
-        let blob = agent.snapshot().held[0].item.key.key_blob();
+        agent.write(|store| expire_own(store, 0));
+        // The first read frees the key, without a write or the server's tick.
         assert!(agent.signer_for(&blob).is_err());
-        // Reads skip the key but leave it to a write, or the server's tick.
-        assert_eq!(agent.snapshot().held.len(), 1);
-        agent.purge_expired();
         assert!(agent.snapshot().held.is_empty());
+        assert!(agent.public_keys().is_empty());
     }
 
     /// `ssh-agent -t`, as [`Agent::with_default_lifetime`]: keys added
@@ -1574,6 +1800,9 @@ mod tests {
         let (add, _) = local_key(0x12, "default@example.com");
         assert_eq!(agent.handle(&add), wire::success());
         let expires = agent.snapshot().held[0]
+            .own
+            .as_ref()
+            .unwrap()
             .expires
             .expect("the default set a lifetime");
         assert!(expires > Instant::now() + Duration::from_secs(30));
@@ -1588,6 +1817,9 @@ mod tests {
         1u32.encode(&mut constrained).unwrap();
         assert_eq!(agent.handle(&constrained), wire::success());
         let expires = agent.snapshot().held[0]
+            .own
+            .as_ref()
+            .unwrap()
             .expires
             .expect("the explicit lifetime was set");
         assert!(expires < Instant::now() + Duration::from_secs(5));
@@ -1601,6 +1833,9 @@ mod tests {
         0u32.encode(&mut zero).unwrap();
         assert_eq!(agent.handle(&zero), wire::success());
         let expires = agent.snapshot().held[1]
+            .own
+            .as_ref()
+            .unwrap()
             .expires
             .expect("the default set a lifetime");
         assert!(expires > Instant::now() + Duration::from_secs(30));
@@ -1870,7 +2105,7 @@ mod tests {
         agent.add_held(key.clone(), None, None, confirm.clone());
         agent.add_held(key.clone(), Some(cert.clone()), None, confirm);
 
-        agent.write(|store| Arc::make_mut(&mut store.held)[0].expires = Some(Instant::now()));
+        agent.write(|store| expire_own(store, 0));
         agent.purge_expired();
         agent.add_key(key.clone(), None);
         let unbound = Connection::default();
@@ -1955,13 +2190,16 @@ mod tests {
 
         assert!(add(&hidden).is_err());
         assert_eq!(
-            agent.snapshot().provider_meta.get(&key.key_blob()),
-            Some(&previous)
+            agent.snapshot().provider_meta(&key.key_blob()).cloned(),
+            Some(previous.clone())
         );
 
         provider.release.store(true, Ordering::SeqCst);
         assert!(add(&hidden).is_err());
-        assert_eq!(agent.snapshot().provider_meta.get(&key.key_blob()), None);
+        assert_eq!(
+            agent.snapshot().provider_meta(&key.key_blob()).cloned(),
+            None
+        );
     }
 
     /// A backend may tell the agent it dropped a key, with
@@ -2844,6 +3082,135 @@ mod tests {
             provider.confirmed_during.load(Ordering::SeqCst),
             "the confirmation was lifted before the add finished"
         );
-        assert_eq!(agent.snapshot().provider_meta.get(&key.key_blob()), None);
+        assert_eq!(
+            agent.snapshot().provider_meta(&key.key_blob()).cloned(),
+            None
+        );
+    }
+
+    /// `ssh-add -C -s` without `-c` adds certificates to a key served with
+    /// `-c`: they take its confirmation, and the key keeps it.
+    #[test]
+    fn certificates_alone_keep_the_served_keys_constraints() {
+        let key = ed25519(0x34, "card");
+        let cert = crate::testing::certify(key.public_key().key_data());
+        let card = Arc::new(Card(Default::default(), key.clone()));
+        let agent = Agent::new()
+            .with_backend(Arc::clone(&card) as _)
+            .with_smartcard(Arc::clone(&card) as _);
+        let pin = Zeroizing::new(Vec::new());
+        let confirm = KeyMeta {
+            confirm: true,
+            destination: Vec::new(),
+        };
+        let unbound = Connection::default();
+        agent
+            .add_smartcard(b"card", &pin, None, confirm.clone(), None, &unbound)
+            .unwrap();
+
+        let certs = AssociatedCerts {
+            certs_only: true,
+            certs: vec![cert.clone()],
+        };
+        agent
+            .add_smartcard(
+                b"card",
+                &pin,
+                None,
+                KeyMeta::default(),
+                Some(certs),
+                &unbound,
+            )
+            .unwrap();
+        for blob in [key.key_blob(), cert.blob().to_vec()] {
+            assert!(matches!(
+                agent.sign(&blob, b"data", 0, &unbound),
+                Err(AgentError::ConfirmRefused)
+            ));
+        }
+    }
+
+    /// A backend that releases an `ssh-add -s -c` key while it is added
+    /// takes its constraints, so the key's certificates are not served
+    /// without them.
+    #[test]
+    fn certificates_are_not_attached_to_a_released_key() {
+        struct Releasing {
+            key: SignerRef,
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+        }
+        impl SmartcardProvider for Releasing {
+            fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+                Ok(self.key.clone())
+            }
+            fn add(
+                &self,
+                _: &[u8],
+                _: &Zeroizing<Vec<u8>>,
+                _: Option<u32>,
+            ) -> Result<(), BoxError> {
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                agent.release(&self.key.key_blob(), true);
+                Ok(())
+            }
+            fn remove(&self, _: &[u8]) -> Result<crate::Removed, BoxError> {
+                Ok(crate::Removed::default())
+            }
+        }
+
+        let key = ed25519(0x35, "card");
+        let cert = crate::testing::certify(key.public_key().key_data());
+        let provider = Arc::new(Releasing {
+            key: key.clone(),
+            agent: std::sync::OnceLock::new(),
+        });
+        let agent = Arc::new(Agent::new().with_smartcard(Arc::clone(&provider) as _));
+        let _ = provider.agent.set(Arc::downgrade(&agent));
+        let confirm = KeyMeta {
+            confirm: true,
+            destination: Vec::new(),
+        };
+        let certs = AssociatedCerts {
+            certs_only: false,
+            certs: vec![cert.clone()],
+        };
+        let pin = Zeroizing::new(Vec::new());
+        let added = agent.add_smartcard(
+            b"card",
+            &pin,
+            None,
+            confirm,
+            Some(certs),
+            &Connection::default(),
+        );
+        assert!(matches!(added, Err(AgentError::UnknownKey)));
+        assert!(agent.snapshot().cert(cert.blob()).is_none());
+    }
+
+    /// A backend's release drops the certificates `ssh-add -s` attached to
+    /// the key with its constraints, in one change.
+    #[test]
+    fn a_release_drops_a_keys_certificates_and_constraints_together() {
+        let key = ed25519(0x36, "card");
+        let cert = crate::testing::certify(key.public_key().key_data());
+        let agent = Agent::new();
+        let confirm = KeyMeta {
+            confirm: true,
+            destination: Vec::new(),
+        };
+        agent.write(|store| {
+            store.set_provider_meta(key.key_blob(), confirm.clone());
+            store.attach_provider_certs(&key, std::slice::from_ref(&cert), None);
+        });
+        let before = agent.snapshot();
+        assert!(agent.release(&key.key_blob(), true));
+        let after = agent.snapshot();
+        assert!(
+            before.cert(cert.blob()).is_some() && before.provider_meta(&key.key_blob()).is_some()
+        );
+        assert!(
+            after.cert(cert.blob()).is_none() && after.provider_meta(&key.key_blob()).is_none()
+        );
+        assert!(after.provider.is_empty());
     }
 }
