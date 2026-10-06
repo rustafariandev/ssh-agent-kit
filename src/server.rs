@@ -15,8 +15,8 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -193,8 +193,7 @@ impl Drop for ConnectionSlot {
     }
 }
 
-/// How often the accept loop, and the ticker between ticks, look for new
-/// work and for the server stopping.
+/// How often the accept loop looks for a new connection and for `shutdown`.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Accept connections until `shutdown` is set. Each connection runs on its
@@ -239,13 +238,9 @@ pub fn serve<L: Listener, H: Handler>(
 }
 
 /// Stops the ticker [`spawn_ticker`] started when dropped, so it ends with
-/// [`serve`] however that returns.
-struct Ticker(Arc<AtomicBool>);
-
-impl Drop for Ticker {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
+/// [`serve`] however that returns: dropping the sender wakes it at once.
+struct Ticker {
+    _stop: mpsc::Sender<()>,
 }
 
 /// Tick `handler` about once a second until the returned [`Ticker`] is
@@ -253,24 +248,17 @@ impl Drop for Ticker {
 /// client is talking to the agent, so their secrets do not linger. Not
 /// joined: a tick still running when the server stops finishes on its own.
 fn spawn_ticker<H: Handler>(handler: Arc<H>) -> Ticker {
-    let stopped = Arc::new(AtomicBool::new(false));
-    let stop = Arc::clone(&stopped);
+    let (stop, stopped) = mpsc::channel::<()>();
     std::thread::spawn(move || {
-        let mut last_tick = Instant::now();
-        while !stopped.load(Ordering::SeqCst) {
-            if last_tick.elapsed() >= PURGE_INTERVAL {
-                // A tick that panics once must not stop every later purge.
-                let ticked =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.tick()));
-                if ticked.is_err() {
-                    tracing::error!("tick panicked; ticking on");
-                }
-                last_tick = Instant::now();
+        while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(PURGE_INTERVAL) {
+            // A tick that panics once must not stop every later purge.
+            let ticked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.tick()));
+            if ticked.is_err() {
+                tracing::error!("tick panicked; ticking on");
             }
-            std::thread::sleep(POLL_INTERVAL);
         }
     });
-    Ticker(stop)
+    Ticker { _stop: stop }
 }
 
 #[derive(Debug, Error)]
@@ -449,8 +437,6 @@ mod tests {
     /// connections.
     #[test]
     fn a_waiting_tick_does_not_hold_up_connections() {
-        use std::sync::mpsc;
-
         struct StuckTick {
             ticked: Mutex<mpsc::Sender<()>>,
             release: Mutex<mpsc::Receiver<()>>,
@@ -497,8 +483,6 @@ mod tests {
     /// A tick that panics does not stop the ticks after it.
     #[test]
     fn ticks_go_on_after_one_panics() {
-        use std::sync::mpsc;
-
         struct PanicsOnce {
             panicked: AtomicBool,
             ticked: Mutex<mpsc::Sender<()>>,

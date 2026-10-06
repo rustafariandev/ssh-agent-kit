@@ -31,6 +31,9 @@ follows [Semantic Versioning](https://semver.org/).
   them as soon as it started, so the key signed under them while the
   provider asked for a PIN, and kept them if the add failed. They now
   change only once the add succeeds.
+- A key change that waited for another connection's, such as one held up
+  by a PIN prompt, still ran if the agent was locked meanwhile. It is now
+  refused.
 - A `Handler::tick` that waited, such as one making a key change while
   another connection's was held up by a PIN prompt, stopped `serve` from
   accepting connections until it returned. Ticks now run on a thread of

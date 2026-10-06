@@ -860,7 +860,12 @@ impl Agent {
     fn handle_unlocked(&self, request: Request, connection: &mut Connection) -> Vec<u8> {
         // Writes are taken one at a time; reads work on a store snapshot and
         // never wait for them.
-        let _writing = request.changes_keys().then(|| lock(&self.changes));
+        let writing = request.changes_keys().then(|| lock(&self.changes));
+        // The agent may have been locked while this change waited its turn.
+        if writing.is_some() && self.is_locked() {
+            tracing::warn!(request = request.name(), "refused: agent is locked");
+            return wire::failure();
+        }
         match request {
             Request::RequestIdentities => {
                 let identities = self.identities_for(connection);
@@ -1054,7 +1059,7 @@ impl Agent {
             .as_ref()
             .ok_or(AgentError::NoSmartcardProvider)?;
         let lifetime = self.lifetime_for(lifetime);
-        self.purge_expired();
+        self.purge_backends();
         // Fetch the key first: its blob names the constraints.
         let key = source.resolve(provider, pin).map_err(AgentError::Backend)?;
         let certs_only = certs.as_ref().is_some_and(|c| c.certs_only);
@@ -1072,44 +1077,50 @@ impl Agent {
         if !self.manage_allowed(change, connection) {
             return Err(AgentError::PolicyRefused);
         }
+        let matching = match certs {
+            Some(certs) => {
+                let (matching, others): (Vec<_>, Vec<_>) = certs
+                    .certs
+                    .into_iter()
+                    .partition(|c| c.certifies(key.public_key()));
+                if !others.is_empty() {
+                    tracing::warn!(
+                        key = key.comment(),
+                        skipped = others.len(),
+                        "certificates for another key skipped"
+                    );
+                }
+                if matching.is_empty() && certs_only {
+                    return Err(AgentError::NoMatchingCertificate);
+                }
+                matching
+            }
+            None => Vec::new(),
+        };
         self.publish_constrained(key.key_blob(), meta, || {
             if !certs_only {
                 source
                     .add(provider, pin, lifetime)
                     .map_err(AgentError::Backend)?;
             }
-            let Some(certs) = certs else {
-                return Ok(());
-            };
-            let (matching, others): (Vec<_>, Vec<_>) = certs
-                .certs
-                .into_iter()
-                .partition(|c| c.certifies(key.public_key()));
-            if !others.is_empty() {
-                tracing::warn!(
-                    key = key.comment(),
-                    skipped = others.len(),
-                    "certificates for another key skipped"
-                );
-            }
-            if matching.is_empty() && certs_only {
-                return Err(AgentError::NoMatchingCertificate);
-            }
-            for cert in matching {
-                tracing::info!(
-                    key = key.comment(),
-                    key_id = cert.certificate().key_id(),
-                    "serving certificate"
-                );
-                let identity = CertIdentity {
-                    cert,
-                    comment: key.comment().to_owned(),
-                    signer: CertSigner::Provider(key.clone()),
-                };
-                self.write(|store| store.push_cert(identity.clone(), lifetime));
-            }
             Ok(())
-        })
+        })?;
+        // Once the key's constraints are in place, so a certificate is never
+        // served under the ones it had before.
+        for cert in matching {
+            tracing::info!(
+                key = key.comment(),
+                key_id = cert.certificate().key_id(),
+                "serving certificate"
+            );
+            let identity = CertIdentity {
+                cert,
+                comment: key.comment().to_owned(),
+                signer: CertSigner::Provider(key.clone()),
+            };
+            self.write(|store| store.push_cert(identity.clone(), lifetime));
+        }
+        Ok(())
     }
 
     /// `ssh-add -e PROVIDER`: stop serving the key it names and the
@@ -2392,49 +2403,58 @@ mod tests {
         assert_eq!(Agent::new().handle(&add), wire::failure());
     }
 
-    /// Listing and signing go on while a key change waits on the user,
-    /// such as for a PIN: only other key changes wait for it.
-    #[test]
-    fn reads_do_not_wait_for_a_key_change() {
-        use std::sync::mpsc;
-        struct Prompting {
-            key: SignerRef,
-            prompted: Mutex<mpsc::Sender<()>>,
-            answer: Mutex<mpsc::Receiver<()>>,
+    /// A smartcard provider whose key lookup waits, as on a PIN prompt, until
+    /// told to go on.
+    struct Prompting {
+        key: SignerRef,
+        prompted: Mutex<std::sync::mpsc::Sender<()>>,
+        answer: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl SmartcardProvider for Prompting {
+        fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+            let _ = self.prompted.lock().unwrap().send(());
+            let _ = self.answer.lock().unwrap().recv();
+            Ok(self.key.clone())
         }
-        impl SmartcardProvider for Prompting {
-            fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
-                let _ = self.prompted.lock().unwrap().send(());
-                let _ = self.answer.lock().unwrap().recv();
-                Ok(self.key.clone())
-            }
-            fn add(
-                &self,
-                _: &[u8],
-                _: &Zeroizing<Vec<u8>>,
-                _: Option<u32>,
-            ) -> Result<(), BoxError> {
-                Ok(())
-            }
-            fn remove(&self, _: &[u8]) -> Result<crate::Removed, BoxError> {
-                Ok(crate::Removed::default())
-            }
+        fn add(&self, _: &[u8], _: &Zeroizing<Vec<u8>>, _: Option<u32>) -> Result<(), BoxError> {
+            Ok(())
         }
+        fn remove(&self, _: &[u8]) -> Result<crate::Removed, BoxError> {
+            Ok(crate::Removed::default())
+        }
+    }
 
-        let (prompted, prompt) = mpsc::channel();
-        let (answer, answered) = mpsc::channel();
+    /// An agent with a [`Prompting`] provider, the `ssh-add -s` request for
+    /// its key, word of the prompt starting, and the answer that ends it.
+    fn prompting_agent() -> (
+        Arc<Agent>,
+        Vec<u8>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (prompted, prompt) = std::sync::mpsc::channel();
+        let (answer, answered) = std::sync::mpsc::channel();
         let provider = Prompting {
             key: ed25519(0x2a, "card"),
             prompted: Mutex::new(prompted),
             answer: Mutex::new(answered),
         };
         let agent = Arc::new(Agent::new().with_smartcard(Arc::new(provider)));
-        let (add, public) = local_key(0x2b, "held@example.com");
-        assert_eq!(agent.handle(&add), wire::success());
-
         let mut add_card = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY];
         b"card".as_slice().encode(&mut add_card).unwrap();
         b"".as_slice().encode(&mut add_card).unwrap();
+        (agent, add_card, prompt, answer)
+    }
+
+    /// Listing and signing go on while a key change waits on the user,
+    /// such as for a PIN: only other key changes wait for it.
+    #[test]
+    fn reads_do_not_wait_for_a_key_change() {
+        use std::sync::mpsc;
+        let (agent, add_card, prompt, answer) = prompting_agent();
+        let (add, public) = local_key(0x2b, "held@example.com");
+        assert_eq!(agent.handle(&add), wire::success());
+
         let change = {
             let agent = Arc::clone(&agent);
             std::thread::spawn(move || agent.handle(&add_card))
@@ -2459,6 +2479,37 @@ mod tests {
             "a read waited for the key change"
         );
         assert_eq!(change.join().unwrap(), wire::success());
+    }
+
+    /// A key change that waited for another, such as one held up by a PIN
+    /// prompt, is refused if the agent was locked meanwhile.
+    #[test]
+    fn a_waiting_key_change_is_refused_once_locked() {
+        let (agent, add_card, prompt, answer) = prompting_agent();
+        let (add, _) = local_key(0x2c, "held@example.com");
+        assert_eq!(agent.handle(&add), wire::success());
+
+        let first = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || agent.handle(&add_card))
+        };
+        prompt.recv_timeout(Duration::from_secs(5)).unwrap();
+        let waiting = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]))
+        };
+        // Let the removal reach its turn's wait before the lock.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(agent.lock(b"hunter2"));
+        answer.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap(), wire::success());
+        assert_eq!(waiting.join().unwrap(), wire::failure());
+        assert_eq!(
+            agent.snapshot().held.len(),
+            1,
+            "a locked agent's keys were removed"
+        );
     }
 
     /// `allow_manage` sees each change with its key: the key to add and its
