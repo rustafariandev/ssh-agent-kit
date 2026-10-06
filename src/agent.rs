@@ -7,7 +7,7 @@ use crate::extension::{Extension, ExtensionContext};
 use crate::keytype::{KeyDecoder, KeyRegistry};
 use crate::lock::{Locker, PassphraseLock};
 use crate::policy::{
-    Confirm, ConfirmRequest, KeyChange, KeyConstraints, ManageInfo, Policy, SignInfo,
+    Confirm, ConfirmRequest, KeyChange, KeyConstraints, ListInfo, ManageInfo, Policy, SignInfo,
 };
 use crate::signer::{BoxError, SignerRef, VerifyError};
 use crate::wire::{self, Request};
@@ -426,12 +426,14 @@ impl Agent {
 
     /// The identities listed on this connection. A destination-constrained
     /// key is left out when the connection's session bindings do not permit
-    /// it, as OpenSSH's agent does.
+    /// it, as OpenSSH's agent does, and so is one the policy hides
+    /// ([`Policy::allow_list`]).
     pub fn identities_for(&self, connection: &Connection) -> Vec<wire::Listed> {
         let mut out = Vec::new();
         for key in self.public_keys() {
             if let Ok(blob) = key.to_bytes()
                 && self.blob_permitted(&blob, connection)
+                && self.listing_allowed(&key, None, connection)
             {
                 out.push(wire::listed(&key));
             }
@@ -447,11 +449,32 @@ impl Agent {
             }
             if let Some(signer) = self.cert_signer(&identity)
                 && self.blob_permitted(&signer.key_blob(), connection)
+                && self.listing_allowed(signer.public_key(), Some(&identity.cert), connection)
             {
                 out.push((identity.cert.blob().to_vec(), identity.comment));
             }
         }
         out
+    }
+
+    /// Whether the policy lets this connection see `key`, or `certificate`
+    /// for it, in a listing.
+    fn listing_allowed(
+        &self,
+        key: &PublicKey,
+        certificate: Option<&CertKey>,
+        connection: &Connection,
+    ) -> bool {
+        let request = ListInfo {
+            key,
+            certificate,
+            connection,
+        };
+        let allowed = self.policy.as_ref().is_none_or(|p| p.allow_list(&request));
+        if !allowed {
+            tracing::debug!(key = key.comment(), "not listed: the policy hides it");
+        }
+        allowed
     }
 
     /// Whether the key with `blob` may be shown on this connection.
@@ -1678,6 +1701,82 @@ mod tests {
                 "remove - (9 bytes)".to_owned(),
                 "remove-all".to_owned(),
             ]
+        );
+    }
+
+    /// `allow_list` hides keys and certificates from a listing, from every
+    /// source, and sees which identities are certificates. A hidden key can
+    /// still sign: hiding is not refusing.
+    #[test]
+    fn the_policy_filters_the_listing() {
+        #[derive(Default)]
+        struct HideHidden(Mutex<Vec<(String, bool)>>);
+        impl Policy for HideHidden {
+            fn allow_list(&self, request: &ListInfo<'_>) -> bool {
+                let comment = request.key.comment().to_owned();
+                let shown = !comment.starts_with("hidden");
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((comment, request.certificate.is_some()));
+                shown
+            }
+        }
+
+        let policy = Arc::new(HideHidden::default());
+        let hidden_backend = ed25519(2, "hidden-backend");
+        let agent = Agent::new()
+            .with_policy(Arc::clone(&policy) as _)
+            .with_backend(Arc::new(crate::testing::MemoryBackend::new([
+                ed25519(1, "backend"),
+                hidden_backend.clone(),
+            ])));
+        let (add_shown, _) = local_key(3, "added");
+        let (add_hidden, hidden) = local_key(4, "hidden-added");
+        assert_eq!(agent.handle(&add_shown), wire::success());
+        assert_eq!(agent.handle(&add_hidden), wire::success());
+        let hidden_signer = agent.signer_for(&hidden.to_bytes().unwrap()).unwrap();
+        let cert = crate::testing::certify(hidden.key_data());
+        agent.add_cert_key(hidden_signer, cert.clone(), None);
+
+        let listed: Vec<String> = agent.identities().into_iter().map(|(_, c)| c).collect();
+        assert_eq!(listed, vec!["backend", "added"]);
+        assert_eq!(
+            *policy.0.lock().unwrap(),
+            vec![
+                ("backend".to_owned(), false),
+                ("hidden-backend".to_owned(), false),
+                ("added".to_owned(), false),
+                ("hidden-added".to_owned(), false),
+                ("hidden-added".to_owned(), true),
+            ]
+        );
+
+        // Hidden, but not refused.
+        assert!(
+            agent
+                .sign(
+                    &hidden.to_bytes().unwrap(),
+                    b"data",
+                    0,
+                    &Connection::default()
+                )
+                .is_ok()
+        );
+        assert!(
+            agent
+                .sign(
+                    &hidden_backend.key_blob(),
+                    b"data",
+                    0,
+                    &Connection::default()
+                )
+                .is_ok()
+        );
+        assert!(
+            agent
+                .sign(cert.blob(), b"data", 0, &Connection::default())
+                .is_ok()
         );
     }
 

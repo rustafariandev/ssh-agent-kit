@@ -2,8 +2,9 @@
 //!
 //! - [`Confirm`] asks the user about one use of a key added with
 //!   `ssh-add -c`. Without one, such keys never sign.
-//! - [`Policy`] is a veto and audit hook over every signature and every
-//!   key change, beyond the constraints the client attached.
+//! - [`Policy`] is a veto and audit hook over every signature, every key
+//!   change and which keys are listed, beyond the constraints the client
+//!   attached.
 
 use crate::cert::CertKey;
 use crate::destination::{Connection, DestinationConstraint};
@@ -69,12 +70,35 @@ pub trait Policy: Send + Sync {
     /// Called after each signature, for auditing.
     fn signed(&self, _request: &SignInfo<'_>) {}
 
+    /// Whether to show an identity when a client lists keys (`ssh-add -l`,
+    /// and `ssh` choosing which keys to offer). Called for each key and
+    /// certificate on every listing, after keys the connection's session
+    /// bindings rule out (`ssh-add -h`) are already left out. Returning
+    /// `false` leaves it out.
+    ///
+    /// Hiding is not refusing: a client that already knows a key can still
+    /// ask the agent to sign with it. Refuse those in [`Self::allow_sign`].
+    fn allow_list(&self, _request: &ListInfo<'_>) -> bool {
+        true
+    }
+
     /// Whether a client may make a key change: `ssh-add`, `ssh-add -d`,
     /// `-D`, `-s` or `-e`. Called before the change, and before each key's
     /// own `ssh-add -h` constraint is checked. Returning `false` refuses it.
     fn allow_manage(&self, _request: &ManageInfo<'_>) -> bool {
         true
     }
+}
+
+/// An identity the agent is about to list.
+#[derive(Debug, Clone, Copy)]
+pub struct ListInfo<'a> {
+    /// The key; for a certificate, the key it certifies.
+    pub key: &'a PublicKey,
+    /// The certificate, when the identity is one.
+    pub certificate: Option<&'a CertKey>,
+    /// The client connection, with its session bindings.
+    pub connection: &'a Connection,
 }
 
 /// A key change a client asks for, and the connection it came on.

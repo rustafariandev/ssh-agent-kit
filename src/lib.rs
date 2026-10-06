@@ -11,7 +11,7 @@
 //! | answer `ssh-add -s`/`-e PROVIDER`     | [`SmartcardProvider`]          | [`Agent::with_smartcard`]      |
 //! | accept new key types in `ssh-add FILE`| [`KeyDecoder`] + [`Signer`]    | [`Agent::with_key_type`]       |
 //! | ask the user about `ssh-add -c` keys  | [`Confirm`]                    | [`Agent::with_confirm`]        |
-//! | veto or audit signatures and changes  | [`Policy`]                     | [`Agent::with_policy`]         |
+//! | veto signatures, changes and listing  | [`Policy`]                     | [`Agent::with_policy`]         |
 //! | answer `SSH_AGENTC_EXTENSION` names   | [`Extension`]                  | [`Agent::with_extension`]      |
 //! | hear lock, unlock and `ssh-add -D`    | [`Lifecycle`]                  | [`Agent::with_lifecycle`]      |
 //! | keep the lock elsewhere               | [`Locker`]                     | [`Agent::with_locker`]         |
@@ -67,7 +67,7 @@ pub use local::{
 };
 pub use lock::{Locker, PassphraseLock};
 pub use policy::{
-    Confirm, ConfirmRequest, KeyChange, KeyConstraints, ManageInfo, Policy, SignInfo,
+    Confirm, ConfirmRequest, KeyChange, KeyConstraints, ListInfo, ManageInfo, Policy, SignInfo,
 };
 pub use server::{
     Handler, Listener, SocketError, SocketGuard, Stream, bind_socket, default_socket_path,

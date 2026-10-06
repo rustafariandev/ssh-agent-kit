@@ -22,7 +22,7 @@ where keys come from and what is allowed. Out of the box it supports:
 | answer `ssh-add -s`/`-e PROVIDER` (smartcards) | `SmartcardProvider`          | `Agent::with_smartcard` |
 | accept new key types in `ssh-add FILE`         | `KeyDecoder` + `Signer`      | `Agent::with_key_type`  |
 | ask the user about `ssh-add -c` keys           | `Confirm`                    | `Agent::with_confirm`   |
-| veto or audit signatures and key changes       | `Policy`                     | `Agent::with_policy`    |
+| veto or audit signatures, key changes, listing | `Policy`                     | `Agent::with_policy`    |
 | answer `SSH_AGENTC_EXTENSION` requests         | `Extension`                  | `Agent::with_extension` |
 | hear lock, unlock and `ssh-add -D`             | `Lifecycle`                  | `Agent::with_lifecycle` |
 | keep the lock state elsewhere                  | `Locker`                     | `Agent::with_locker`    |
