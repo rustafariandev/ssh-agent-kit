@@ -514,7 +514,7 @@ pub fn describe_data(data: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn rsa_hash_follows_flags() {
         use super::*;
@@ -533,7 +533,7 @@ mod tests {
 
     /// The constraint-extension bytes for one valid destination constraint:
     /// from the origin to `example.com`, identified by `key(7, "")`.
-    fn destination_extension() -> Vec<u8> {
+    pub(crate) fn destination_extension() -> Vec<u8> {
         let host_key = key(7, "");
         let mut hostkeys = Vec::new();
         host_key.to_bytes().unwrap().encode(&mut hostkeys).unwrap();

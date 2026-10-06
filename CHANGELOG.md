@@ -4,6 +4,19 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- An `ssh-add -c`/`-h` key could lose its constraints, and sign without
+  them, when it was re-added or signed with on one connection while another
+  removed it. A key and its constraints now change under one lock, key
+  changes run one at a time, and a sign whose key's constraints change
+  during the lookup is refused.
+- An `ssh-add -h` key could be listed to a connection its constraint hides
+  it from while another connection removed it. A listing during which
+  constraints change is now taken again.
+
 ## [0.1.0] - 2026-10-04
 
 First release, extracted from the agent in
