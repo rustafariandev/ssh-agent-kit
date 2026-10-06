@@ -34,11 +34,19 @@ pub trait Backend: Send + Sync {
 
     /// `ssh-add -d`: stop serving the identity whose public key blob is
     /// `key_blob`. Returns whether it was served.
+    ///
+    /// Called while the agent takes key changes one at a time: a request
+    /// that changes keys (through [`Agent::handle`](crate::Agent::handle))
+    /// made from here waits for this one to finish, so never returns.
+    /// [`Agent::release`](crate::Agent::release) and the agent's other
+    /// methods may be called.
     fn remove(&self, _key_blob: &[u8]) -> bool {
         false
     }
 
     /// `ssh-add -D`: stop serving every identity this backend can drop.
+    /// Called while key changes are taken one at a time, as
+    /// [`Self::remove`] is.
     fn remove_all(&self) {}
 
     /// Drop identities whose lifetime has run out. Called before every
@@ -63,6 +71,13 @@ pub struct Removed {
 /// crate decides what the string means, such as a slot or a key label on
 /// its own device. The agent handles constraints, lifetimes' defaults and
 /// attached certificates around these calls.
+///
+/// Every method is called while the agent takes key changes one at a time:
+/// a request that changes keys (through
+/// [`Agent::handle`](crate::Agent::handle)) made from one waits for the
+/// current one to finish, so never returns, and a slow call, such as a PIN
+/// prompt, holds up other connections' key changes (not their listings or
+/// signatures) until it returns.
 pub trait SmartcardProvider: Send + Sync {
     /// The key `provider` names, fetched (or found in a cache) but not
     /// served yet. `pin` is the one `ssh-add -s` read, often empty.
@@ -91,6 +106,10 @@ pub trait Lifecycle: Send + Sync {
     fn unlocked(&self) {}
 
     /// `ssh-add -D` removed every identity.
+    ///
+    /// Called while the agent takes key changes one at a time: a request
+    /// that changes keys (through [`Agent::handle`](crate::Agent::handle))
+    /// made from here waits for this one to finish, so never returns.
     fn cleared(&self) {}
 }
 

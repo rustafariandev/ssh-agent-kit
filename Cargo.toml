@@ -42,6 +42,7 @@ tracing = "0.1"
 nix = { version = "0.30", features = ["fs", "user", "socket"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = "1"
+arc-swap = "1"
 
 [dev-dependencies]
 tempfile = "3"

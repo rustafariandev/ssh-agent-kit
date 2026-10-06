@@ -10,15 +10,27 @@ follows [Semantic Versioning](https://semver.org/).
 
 - An `ssh-add -c`/`-h` key could lose its constraints, and sign without
   them, when it was re-added or signed with on one connection while another
-  removed it. A key and its constraints now change under one lock, key
-  changes run one at a time, and a sign whose key's constraints change
-  during the lookup is refused.
+  removed it. A key and its constraints now change together in one
+  snapshot, key changes run one at a time, and a sign during whose lookup
+  the key's constraints change looks it up again, and is refused if they
+  keep changing.
 - An `ssh-add -h` key could be listed to a connection its constraint hides
   it from while another connection removed it. A listing during which
   constraints change is now taken again.
 - A `KeyDecoder` that called back into the agent while decoding, for
   example to register a key type, deadlocked the request. Requests now
-  decode outside the registry lock.
+  decode with their own snapshot of the registry.
+- An `ssh-add -c`/`-h` key that expired left its constraints behind, so the
+  same key served again later was still constrained. They now go with it,
+  unless a certificate it signs for is still served.
+
+### Changed
+
+- Listing and signing no longer wait on key changes: they read an immutable
+  snapshot of the added keys, certificates and constraints, which each
+  change replaces with a changed copy. Extensions and key types are
+  registered the same way. Expired keys are skipped by reads and dropped
+  by the next change or by the server's once-a-second tick.
 
 ## [0.1.0] - 2026-10-04
 

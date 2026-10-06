@@ -85,6 +85,10 @@ pub trait Policy: Send + Sync {
     /// Whether a client may make a key change: `ssh-add`, `ssh-add -d`,
     /// `-D`, `-s` or `-e`. Called before the change, and before each key's
     /// own `ssh-add -h` constraint is checked. Returning `false` refuses it.
+    ///
+    /// Called while the agent takes key changes one at a time: a request
+    /// that changes keys (through [`Agent::handle`](crate::Agent::handle))
+    /// made from here waits for this one to finish, so never returns.
     fn allow_manage(&self, _request: &ManageInfo<'_>) -> bool {
         true
     }

@@ -91,10 +91,16 @@ impl KeyRegistry {
     /// can replace a built-in type as well as add a new one. Earlier decoders
     /// left with no name of their own are dropped.
     pub fn register(&mut self, decoder: impl KeyDecoder + 'static) {
+        self.register_shared(Arc::new(decoder));
+    }
+
+    /// [`Self::register`] for a decoder already shared, so a registration
+    /// can be applied again to a newer copy of the registry.
+    pub(crate) fn register_shared(&mut self, decoder: Arc<dyn KeyDecoder>) {
         let names = decoder.key_types();
         self.decoders
             .retain(|d| d.key_types().iter().any(|t| !names.contains(t)));
-        self.decoders.push(Arc::new(decoder));
+        self.decoders.push(decoder);
     }
 
     /// Decode an `ADD_IDENTITY` body's key by name, including the trailing
