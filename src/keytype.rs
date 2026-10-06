@@ -15,6 +15,7 @@
 
 use crate::local;
 use crate::signer::SignerRef;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Why an `ADD_IDENTITY` request's key could not be decoded.
@@ -61,8 +62,9 @@ impl KeyDecoder for LocalDecoder {
 }
 
 /// The key types the agent can decode, in registration order.
+#[derive(Clone)]
 pub struct KeyRegistry {
-    decoders: Vec<Box<dyn KeyDecoder>>,
+    decoders: Vec<Arc<dyn KeyDecoder>>,
 }
 
 impl KeyRegistry {
@@ -92,7 +94,7 @@ impl KeyRegistry {
         let names = decoder.key_types();
         self.decoders
             .retain(|d| d.key_types().iter().any(|t| !names.contains(t)));
-        self.decoders.push(Box::new(decoder));
+        self.decoders.push(Arc::new(decoder));
     }
 
     /// Decode an `ADD_IDENTITY` body's key by name, including the trailing

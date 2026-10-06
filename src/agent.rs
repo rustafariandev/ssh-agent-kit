@@ -87,7 +87,9 @@ pub struct Agent {
     /// Protocol extension handlers, matched by name.
     extensions: Mutex<Vec<Arc<dyn Extension>>>,
     /// Key-type decoders for `ssh-add FILE`, matched by the request's key type.
-    key_types: Mutex<KeyRegistry>,
+    /// A request decodes with its own handle on them, outside the lock, so a
+    /// decoder may call back into the agent.
+    key_types: Mutex<Arc<KeyRegistry>>,
     /// Asks the user about keys added with `ssh-add -c`; without one they
     /// never sign.
     confirm: Option<Arc<dyn Confirm>>,
@@ -269,7 +271,7 @@ impl Agent {
             store: Mutex::new(Store::default()),
             changes: Mutex::new(()),
             extensions: Mutex::new(Vec::new()),
-            key_types: Mutex::new(KeyRegistry::builtin()),
+            key_types: Mutex::new(Arc::new(KeyRegistry::builtin())),
             confirm: None,
             policy: None,
             lifecycle: Vec::new(),
@@ -362,7 +364,7 @@ impl Agent {
     /// requests whose key type it answers. A later registration under a name
     /// wins.
     pub fn register_key_type(&self, decoder: impl KeyDecoder + 'static) {
-        lock(&self.key_types).register(decoder);
+        Arc::make_mut(&mut lock(&self.key_types)).register(decoder);
     }
 
     /// The lifetime keys get without their own `ssh-add -t`.
@@ -620,10 +622,8 @@ impl Agent {
     /// bindings a client records with `session-bind@openssh.com` for the life
     /// of its connection.
     pub fn handle_in(&self, body: &[u8], connection: &mut Connection) -> Vec<u8> {
-        let request = {
-            let key_types = lock(&self.key_types);
-            wire::parse_request_with(&key_types, body)
-        };
+        let key_types = Arc::clone(&lock(&self.key_types));
+        let request = wire::parse_request_with(&key_types, body);
         let request = match request {
             Ok(request) => request,
             Err(e) => {
@@ -1477,6 +1477,39 @@ mod tests {
             writer.join().unwrap();
         }
         assert_eq!(listed, 0, "a destination-constrained key was listed");
+    }
+
+    /// A key decoder may call back into the agent, here to register another
+    /// key type, while it decodes a key.
+    #[test]
+    fn a_key_decoder_may_register_a_key_type() {
+        struct Reentrant(Arc<std::sync::OnceLock<Arc<Agent>>>);
+        impl KeyDecoder for Reentrant {
+            fn key_types(&self) -> &[&str] {
+                &["ssh-ed25519"]
+            }
+            fn decode(
+                &self,
+                key_type: &str,
+                reader: &mut &[u8],
+            ) -> Result<SignerRef, crate::KeyDecodeError> {
+                let agent = self.0.get().expect("the agent is set");
+                agent.register_key_type(Reentrant(Arc::clone(&self.0)));
+                crate::local::decode(key_type, reader).map(SignerRef::new)
+            }
+        }
+
+        let slot = Arc::new(std::sync::OnceLock::new());
+        let agent = Arc::new(Agent::new().with_key_type(Reentrant(Arc::clone(&slot))));
+        let _ = slot.set(Arc::clone(&agent));
+        let (add, _) = local_key(0x18, "reentrant@example.com");
+        let (done, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(agent.handle(&add)));
+        assert_eq!(
+            answer.recv_timeout(Duration::from_secs(5)),
+            Ok(wire::success()),
+            "the add deadlocked"
+        );
     }
 
     fn ed25519(seed: u8, comment: &str) -> SignerRef {

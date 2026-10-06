@@ -16,6 +16,9 @@ follows [Semantic Versioning](https://semver.org/).
 - An `ssh-add -h` key could be listed to a connection its constraint hides
   it from while another connection removed it. A listing during which
   constraints change is now taken again.
+- A `KeyDecoder` that called back into the agent while decoding, for
+  example to register a key type, deadlocked the request. Requests now
+  decode outside the registry lock.
 
 ## [0.1.0] - 2026-10-04
 
