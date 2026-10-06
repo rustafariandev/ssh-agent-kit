@@ -21,8 +21,12 @@ follows [Semantic Versioning](https://semver.org/).
   example to register a key type, deadlocked the request. Requests now
   decode with their own snapshot of the registry.
 - An `ssh-add -c`/`-h` key that expired left its constraints behind, so the
-  same key served again later was still constrained. They now go with it,
-  unless a certificate it signs for is still served.
+  same key served again later was still constrained. They now go with it.
+- A key added with `ssh-add` and its certificate shared one set of
+  constraints, so adding one without `-c`/`-h` dropped the other's: after
+  `ssh-add -c key` and `ssh-add key-cert.pub`, the key signed without
+  asking. Each now keeps the constraints it was added with, as in OpenSSH.
+  Keys added with `ssh-add -s` still share theirs with their certificates.
 
 ### Changed
 
