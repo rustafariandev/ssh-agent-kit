@@ -20,6 +20,11 @@ pub trait Locker: Send + Sync {
     fn lock(&self, passphrase: &[u8]) -> bool;
 
     /// Unlock if `passphrase` is the one the agent was locked with.
+    ///
+    /// Called while the agent takes unlock attempts one at a time: an
+    /// `ssh-add -X` sent to the agent from here is refused, and one sent
+    /// from another thread while holding a lock this takes waits for this
+    /// one to finish, so never returns.
     fn unlock(&self, passphrase: &[u8]) -> bool;
 }
 

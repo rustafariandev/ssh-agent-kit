@@ -1,4 +1,31 @@
 //! The agent itself: identity bookkeeping and request handling.
+//!
+//! # Concurrency
+//!
+//! The agent is shared between connection threads, and calls user code (a
+//! [`Backend`], [`SmartcardProvider`], [`Policy`], [`Confirm`], [`Locker`]
+//! or [`Lifecycle`]) that may call back into it. Four rules keep it from
+//! taking part in a deadlock:
+//!
+//! 1. User code is never called while a lock is held, except the calls that
+//!    must be ordered: a backend's `remove`/`remove_all` and a provider's
+//!    `add`/`remove` during a key change's turn (`changes`, see
+//!    `Agent::prepared_turn`), and [`Locker::unlock`] during an unlock
+//!    attempt (`unlock_failures`). Everything else a change needs, from key
+//!    lookups to the policy, runs first, against a snapshot.
+//! 2. The closures given to `Agent::write` and the other `rcu` calls only
+//!    change the value they are given: no I/O, no logging, no user code, no
+//!    nested write. They may run more than once.
+//! 3. At most one blocking lock is held at a time.
+//! 4. Each call to user code made while a lock is held has a test that
+//!    calls back into the agent from it and expects an answer, a refusal or
+//!    otherwise, within a timeout rather than a hang.
+//!
+//! A key change or unlock asked for from a callback holding that same lock,
+//! on the same thread, is refused rather than left waiting on itself
+//! (`Holding`). One asked for on another thread while that thread holds a
+//! lock the callback is waiting for is a cycle through user code that
+//! the agent cannot see; rule 1 keeps it to the calls listed there.
 
 use crate::backend::{Backend, Expiring, Lifecycle, SmartcardProvider};
 use crate::cert::{AssociatedCerts, CertKey};
@@ -561,28 +588,61 @@ impl Store {
     }
 }
 
+/// An agent's lock that is held while user code is called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// `changes`, while a key change commits.
+    Change,
+    /// `unlock_failures`, while an unlock attempt is checked.
+    Unlock,
+}
+
 thread_local! {
-    /// The agents, by address, whose key-change turn this thread holds.
-    static TURNS_HELD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// The agents, by address, and their locks this thread holds.
+    static HELD: RefCell<Vec<(usize, Turn)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// This thread's turn to commit a key change to one agent: `changes` held,
-/// and recorded so that a key change asked for from inside it, by a
-/// callback on this thread, is refused rather than waiting on itself.
-struct ChangeTurn<'a> {
-    _changes: MutexGuard<'a, ()>,
+/// Records, while it lives, that this thread holds `turn` of one agent, so
+/// that a callback on this thread asking for it again is refused rather
+/// than left waiting on itself.
+struct Holding {
     agent: usize,
+    turn: Turn,
 }
 
-impl Drop for ChangeTurn<'_> {
+impl Holding {
+    /// Record `turn` of `agent`, unless this thread holds it already.
+    fn enter(agent: &Agent, turn: Turn) -> Option<Holding> {
+        let agent = std::ptr::from_ref(agent) as usize;
+        let held = HELD.with(|held| held.borrow().contains(&(agent, turn)));
+        if held {
+            tracing::error!(
+                ?turn,
+                "refused: asked for from a callback of the same request, on the same \
+                 thread, so it would wait on itself"
+            );
+            return None;
+        }
+        HELD.with(|held| held.borrow_mut().push((agent, turn)));
+        Some(Holding { agent, turn })
+    }
+}
+
+impl Drop for Holding {
     fn drop(&mut self) {
-        TURNS_HELD.with(|held| {
+        HELD.with(|held| {
             let mut held = held.borrow_mut();
-            if let Some(at) = held.iter().rposition(|agent| *agent == self.agent) {
+            if let Some(at) = held.iter().rposition(|h| *h == (self.agent, self.turn)) {
                 held.remove(at);
             }
         });
     }
+}
+
+/// This thread's turn to commit a key change to one agent.
+struct ChangeTurn<'a> {
+    _changes: MutexGuard<'a, ()>,
+    _holding: Holding,
 }
 
 impl Default for Agent {
@@ -866,19 +926,10 @@ impl Agent {
     /// waiting would never end; and once the agent is locked, which it may
     /// have been while this change waited.
     fn take_turn(&self) -> Option<ChangeTurn<'_>> {
-        let agent = std::ptr::from_ref(self) as usize;
-        if TURNS_HELD.with(|held| held.borrow().contains(&agent)) {
-            tracing::error!(
-                "refused: a key change was asked for from inside another, on the same \
-                 thread, so it would wait on itself"
-            );
-            return None;
-        }
-        let changes = lock(&self.changes);
-        TURNS_HELD.with(|held| held.borrow_mut().push(agent));
+        let holding = Holding::enter(self, Turn::Change)?;
         let turn = ChangeTurn {
-            _changes: changes,
-            agent,
+            _changes: lock(&self.changes),
+            _holding: holding,
         };
         if self.is_locked() {
             tracing::warn!("refused: the agent is locked");
@@ -1531,23 +1582,34 @@ impl Agent {
             tracing::warn!("unlock request refused: agent is not locked");
             return wire::failure();
         }
-        // Held through the delay, so guesses are taken one at a time however
-        // many connections send them.
-        let mut failures = lock(&self.unlock_failures);
-        if self.unlock(passphrase) {
-            *failures = 0;
-            tracing::info!("agent unlocked");
-            return wire::success();
+        // Held through the check and the delay, so guesses are taken one at
+        // a time however many connections send them; the hooks run after.
+        let unlocked = {
+            let Some(_holding) = Holding::enter(self, Turn::Unlock) else {
+                return wire::failure();
+            };
+            let mut failures = lock(&self.unlock_failures);
+            if self.locker.unlock(passphrase) {
+                *failures = 0;
+                true
+            } else {
+                *failures = (*failures + 1).min(MAX_UNLOCK_FAILURES);
+                let delay = self.unlock_backoff * *failures;
+                tracing::warn!(
+                    failures = *failures,
+                    ?delay,
+                    "unlock request refused: wrong passphrase"
+                );
+                std::thread::sleep(delay);
+                false
+            }
+        };
+        if !unlocked {
+            return wire::failure();
         }
-        *failures = (*failures + 1).min(MAX_UNLOCK_FAILURES);
-        let delay = self.unlock_backoff * *failures;
-        tracing::warn!(
-            failures = *failures,
-            ?delay,
-            "unlock request refused: wrong passphrase"
-        );
-        std::thread::sleep(delay);
-        wire::failure()
+        self.lifecycle.iter().for_each(|hook| hook.unlocked());
+        tracing::info!("agent unlocked");
+        wire::success()
     }
 
     /// Answer an `SSH_AGENTC_EXTENSION` request. The built-in
@@ -3718,5 +3780,106 @@ mod tests {
         );
         // The policy's key went with `ssh-add -D`; the hook's came after.
         assert_eq!(agent.public_keys().len(), 1);
+    }
+
+    /// The `unlocked` hook runs once the unlock attempt is over, so it may
+    /// send an unlock itself without waiting on the attempt that called it.
+    #[test]
+    fn the_unlocked_hook_may_unlock_again() {
+        struct Relocks {
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            relocked: std::sync::atomic::AtomicBool,
+            reply: Mutex<Option<Vec<u8>>>,
+        }
+        impl Lifecycle for Relocks {
+            fn unlocked(&self) {
+                if self.relocked.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                assert!(agent.lock(b"again"));
+                let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+                b"again".as_slice().encode(&mut unlock).unwrap();
+                *self.reply.lock().unwrap() = Some(agent.handle(&unlock));
+            }
+        }
+
+        let hook = Arc::new(Relocks {
+            agent: std::sync::OnceLock::new(),
+            relocked: Default::default(),
+            reply: Mutex::default(),
+        });
+        let agent = Arc::new(Agent::new().with_lifecycle(Arc::clone(&hook) as _));
+        let _ = hook.agent.set(Arc::downgrade(&agent));
+        assert!(agent.lock(b"hunter2"));
+        let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut unlock).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let _ = done.send(agent.handle(&unlock));
+            });
+        }
+        let outer = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the unlocked hook's unlock deadlocked");
+        assert_eq!(outer, wire::success());
+        assert_eq!(*hook.reply.lock().unwrap(), Some(wire::success()));
+        assert!(!agent.is_locked());
+    }
+
+    /// An `ssh-add -X` sent from inside the `Locker`'s own check, on the
+    /// same thread, is refused rather than waiting on the attempt that
+    /// called it.
+    #[test]
+    fn an_unlock_from_inside_the_locker_is_refused() {
+        struct Reenters {
+            inner: PassphraseLock,
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            reply: Mutex<Option<Vec<u8>>>,
+        }
+        impl Locker for Reenters {
+            fn is_locked(&self) -> bool {
+                self.inner.is_locked()
+            }
+            fn lock(&self, passphrase: &[u8]) -> bool {
+                self.inner.lock(passphrase)
+            }
+            fn unlock(&self, passphrase: &[u8]) -> bool {
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+                passphrase.encode(&mut unlock).unwrap();
+                *self.reply.lock().unwrap() = Some(agent.handle(&unlock));
+                self.inner.unlock(passphrase)
+            }
+        }
+
+        let locker = Arc::new(Reenters {
+            inner: PassphraseLock::default(),
+            agent: std::sync::OnceLock::new(),
+            reply: Mutex::default(),
+        });
+        let agent = Arc::new(
+            Agent::new()
+                .with_locker(Arc::clone(&locker) as _)
+                .with_unlock_backoff(Duration::ZERO),
+        );
+        let _ = locker.agent.set(Arc::downgrade(&agent));
+        assert!(agent.lock(b"hunter2"));
+        let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut unlock).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let _ = done.send(agent.handle(&unlock));
+            });
+        }
+        let outer = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an unlock from inside the locker deadlocked");
+        assert_eq!(outer, wire::success());
+        assert_eq!(*locker.reply.lock().unwrap(), Some(wire::failure()));
     }
 }

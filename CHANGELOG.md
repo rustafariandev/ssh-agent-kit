@@ -47,10 +47,15 @@ follows [Semantic Versioning](https://semver.org/).
 - A key change asked for from a backend's or provider's callback while
   the agent committed another, on the same thread, waited on itself
   forever. It is now refused, with an error logged.
+- A `Lifecycle::unlocked` hook ran while the agent still held the unlock
+  attempt's turn, so an unlock it sent waited on itself forever. Hooks now
+  run once the attempt is over, and an `ssh-add -X` sent from a `Locker`'s
+  own `unlock` is refused instead of waiting.
 - A `Handler::tick` that waited, such as one making a key change while
   another connection's was held up by a PIN prompt, stopped `serve` from
   accepting connections until it returned. Ticks now run on a thread of
-  their own.
+  their own. The ticker holds the handler only while it ticks, so the
+  agent and its keys go with their last owner once `serve` returns.
 
 ### Changed
 

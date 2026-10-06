@@ -207,7 +207,7 @@ pub fn serve<L: Listener, H: Handler>(
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     listener.start()?;
-    let _ticker = spawn_ticker(Arc::clone(&handler));
+    let _ticker = spawn_ticker(&handler);
     let active = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -244,13 +244,22 @@ struct Ticker {
 }
 
 /// Tick `handler` about once a second until the returned [`Ticker`] is
-/// dropped. Drops keys whose `ssh-add -t` lifetime has run out even when no
-/// client is talking to the agent, so their secrets do not linger. Not
-/// joined: a tick still running when the server stops finishes on its own.
-fn spawn_ticker<H: Handler>(handler: Arc<H>) -> Ticker {
+/// dropped or the handler is. Drops keys whose `ssh-add -t` lifetime has
+/// run out even when no client is talking to the agent, so their secrets do
+/// not linger. Not joined: a tick still running when the server stops
+/// finishes on its own.
+///
+/// The ticker holds the handler only for the length of each tick, so once
+/// [`serve`] returns and its owner drops it, the agent and its keys go even
+/// though the ticker has not woken yet.
+fn spawn_ticker<H: Handler>(handler: &Arc<H>) -> Ticker {
     let (stop, stopped) = mpsc::channel::<()>();
+    let handler = Arc::downgrade(handler);
     std::thread::spawn(move || {
         while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(PURGE_INTERVAL) {
+            let Some(handler) = handler.upgrade() else {
+                return;
+            };
             // A tick that panics once must not stop every later purge.
             let ticked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.tick()));
             if ticked.is_err() {
@@ -478,6 +487,49 @@ mod tests {
         release.send(()).unwrap();
         shutdown.store(true, Ordering::SeqCst);
         server.join().unwrap().unwrap();
+    }
+
+    /// Between ticks the ticker does not hold the handler, so the agent
+    /// goes with its last owner once the server stops.
+    #[test]
+    fn the_ticker_holds_the_handler_only_while_ticking() {
+        struct Ticks(Mutex<mpsc::Sender<()>>);
+        impl Handler for Ticks {
+            fn handle_in(&self, _body: &[u8], _connection: &mut Connection) -> Vec<u8> {
+                wire::failure()
+            }
+            fn tick(&self) {
+                let _ = self.0.lock().unwrap().send(());
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (listener, _guard) = bind_socket(&dir.path().join("agent.sock")).unwrap();
+        let (ticked, ticks) = mpsc::channel();
+        let handler = Arc::new(Ticks(Mutex::new(ticked)));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = {
+            let handler = Arc::clone(&handler);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || serve(listener, handler, shutdown))
+        };
+        ticks.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Ours and `serve`'s, once the tick that just ran has returned.
+        let started = std::time::Instant::now();
+        while Arc::strong_count(&handler) != 2 && started.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            Arc::strong_count(&handler),
+            2,
+            "the ticker kept the handler"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        let weak = Arc::downgrade(&handler);
+        drop(handler);
+        assert!(weak.upgrade().is_none(), "the handler outlived its owners");
     }
 
     /// A tick that panics does not stop the ticks after it.
