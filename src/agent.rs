@@ -955,16 +955,22 @@ impl Agent {
         connection: &Connection,
     ) -> Result<Vec<u8>, AgentError> {
         let signer = self.signer_for(key_blob)?;
-        self.check_constraints(&signer, key_blob, data, connection)?;
+        let meta = self.meta_for(&signer.key_blob());
+        self.check_destination(&meta, key_blob, data, connection)?;
         let info = SignInfo {
             key: signer.public_key(),
             data,
             connection,
         };
+        // Before the confirm prompt, so the user is never asked about a
+        // signature the policy would refuse anyway.
         if let Some(policy) = &self.policy
             && !policy.allow_sign(&info)
         {
             return Err(AgentError::PolicyRefused);
+        }
+        if meta.confirm {
+            self.confirm_use(&signer, data)?;
         }
         let hash = match wire::rsa_hash(flags) {
             Some(hash) => hash,
@@ -981,17 +987,16 @@ impl Agent {
         Ok(wire::sign_response(&sig))
     }
 
-    /// Enforce the `ssh-add -c` and `-h` constraints of the key a sign
-    /// request names: destination-constrained keys need a session binding
-    /// that matches, and confirmed keys ask the user every time.
-    fn check_constraints(
+    /// Enforce the `ssh-add -h` constraint of the key a sign request names:
+    /// a destination-constrained key signs only a userauth request on a
+    /// connection whose session binding the constraint permits.
+    fn check_destination(
         &self,
-        signer: &SignerRef,
+        meta: &KeyMeta,
         requested_blob: &[u8],
         data: &[u8],
         connection: &Connection,
     ) -> Result<(), AgentError> {
-        let meta = self.meta_for(&signer.key_blob());
         if !meta.destination.is_empty() {
             let last = connection
                 .bindings()
@@ -1014,17 +1019,21 @@ impl Agent {
                 return Err(AgentError::DestinationRefused);
             }
         }
-        if meta.confirm {
-            let key = signer.public_key();
-            let request = ConfirmRequest {
-                identity: key.comment().to_owned(),
-                fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
-                subject: wire::describe_data(data),
-            };
-            let answer = self.confirm.as_ref().and_then(|c| c.confirm(&request));
-            if answer != Some(true) {
-                return Err(AgentError::ConfirmRefused);
-            }
+        Ok(())
+    }
+
+    /// `ssh-add -c`: ask the user to allow this one use of `signer`. Without
+    /// a [`Confirm`] prompt, or without a yes, the signature is refused.
+    fn confirm_use(&self, signer: &SignerRef, data: &[u8]) -> Result<(), AgentError> {
+        let key = signer.public_key();
+        let request = ConfirmRequest {
+            identity: key.comment().to_owned(),
+            fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+            subject: wire::describe_data(data),
+        };
+        let answer = self.confirm.as_ref().and_then(|c| c.confirm(&request));
+        if answer != Some(true) {
+            return Err(AgentError::ConfirmRefused);
         }
         Ok(())
     }
@@ -1330,6 +1339,42 @@ mod tests {
             agent.sign(&blob, b"no", 0, &Connection::default()),
             Err(AgentError::PolicyRefused)
         ));
+    }
+
+    /// The policy is asked before the `ssh-add -c` prompt: the user is never
+    /// asked about a signature the policy refuses, and is still asked about
+    /// one it allows.
+    #[test]
+    fn the_policy_is_asked_before_the_confirm_prompt() {
+        use crate::testing::RecordingConfirm;
+        struct OnlyOk;
+        impl Policy for OnlyOk {
+            fn allow_sign(&self, request: &SignInfo<'_>) -> bool {
+                request.data.starts_with(b"ok:")
+            }
+        }
+        let confirm = Arc::new(RecordingConfirm::answering([Some(true)]));
+        let agent = Agent::new()
+            .with_policy(Arc::new(OnlyOk))
+            .with_confirm(Arc::clone(&confirm) as _);
+        let (mut add, public) = local_key(1, "ferris@example.com");
+        add[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        assert_eq!(agent.handle(&add), wire::success());
+        let blob = public.to_bytes().unwrap();
+
+        assert!(matches!(
+            agent.sign(&blob, b"no", 0, &Connection::default()),
+            Err(AgentError::PolicyRefused)
+        ));
+        assert!(confirm.requests.lock().unwrap().is_empty());
+
+        assert!(
+            agent
+                .sign(&blob, b"ok: fine", 0, &Connection::default())
+                .is_ok()
+        );
+        assert_eq!(confirm.requests.lock().unwrap().len(), 1);
     }
 
     /// `ssh-add -s`/`-e` reach the smartcard provider, which owns the key;

@@ -57,8 +57,10 @@ pub struct SignInfo<'a> {
 /// What the agent allows, beyond each key's own constraints. Every method
 /// allows by default.
 pub trait Policy: Send + Sync {
-    /// Called for each sign request once the key's `ssh-add -c`/`-h`
-    /// constraints pass. Returning `false` refuses it.
+    /// Called for each sign request once the key's `ssh-add -h` destination
+    /// constraint passes, and before the `ssh-add -c` confirm prompt, so the
+    /// user is never asked about a signature the policy refuses. Returning
+    /// `false` refuses it.
     fn allow_sign(&self, _request: &SignInfo<'_>) -> bool {
         true
     }
