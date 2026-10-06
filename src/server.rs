@@ -30,7 +30,8 @@ pub trait Handler: Send + Sync + 'static {
     /// (keys added with `ssh-add -t`) is dropped even when no client talks.
     /// Runs on a thread of its own, so it may wait, such as for a key change
     /// another connection is making, without holding up the server; the
-    /// next tick comes once it returns.
+    /// next tick comes once it returns. A tick that panics is logged, and
+    /// ticking goes on.
     fn tick(&self) {}
 }
 
@@ -258,7 +259,12 @@ fn spawn_ticker<H: Handler>(handler: Arc<H>) -> Ticker {
         let mut last_tick = Instant::now();
         while !stopped.load(Ordering::SeqCst) {
             if last_tick.elapsed() >= PURGE_INTERVAL {
-                handler.tick();
+                // A tick that panics once must not stop every later purge.
+                let ticked =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.tick()));
+                if ticked.is_err() {
+                    tracing::error!("tick panicked; ticking on");
+                }
                 last_tick = Instant::now();
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -486,6 +492,45 @@ mod tests {
         release.send(()).unwrap();
         shutdown.store(true, Ordering::SeqCst);
         server.join().unwrap().unwrap();
+    }
+
+    /// A tick that panics does not stop the ticks after it.
+    #[test]
+    fn ticks_go_on_after_one_panics() {
+        use std::sync::mpsc;
+
+        struct PanicsOnce {
+            panicked: AtomicBool,
+            ticked: Mutex<mpsc::Sender<()>>,
+        }
+        impl Handler for PanicsOnce {
+            fn handle_in(&self, _body: &[u8], _connection: &mut Connection) -> Vec<u8> {
+                wire::failure()
+            }
+            fn tick(&self) {
+                if !self.panicked.swap(true, Ordering::SeqCst) {
+                    panic!("the first tick fails");
+                }
+                let _ = self.ticked.lock().unwrap().send(());
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (listener, _guard) = bind_socket(&dir.path().join("agent.sock")).unwrap();
+        let (ticked, ticks) = mpsc::channel();
+        let handler = Arc::new(PanicsOnce {
+            panicked: AtomicBool::new(false),
+            ticked: Mutex::new(ticked),
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = {
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || serve(listener, handler, shutdown))
+        };
+        let next = ticks.recv_timeout(Duration::from_secs(5));
+        shutdown.store(true, Ordering::SeqCst);
+        server.join().unwrap().unwrap();
+        assert!(next.is_ok(), "no tick after the one that panicked");
     }
 
     /// Sockets bound at the same time from many threads are all owner-only,

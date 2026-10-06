@@ -27,6 +27,10 @@ follows [Semantic Versioning](https://semver.org/).
   `ssh-add -c key` and `ssh-add key-cert.pub`, the key signed without
   asking. Each now keeps the constraints it was added with, as in OpenSSH.
   Keys added with `ssh-add -s` still share theirs with their certificates.
+- Re-adding an `ssh-add -s -c`/`-h` key with looser constraints lifted
+  them as soon as it started, so the key signed under them while the
+  provider asked for a PIN, and kept them if the add failed. They now
+  change only once the add succeeds.
 - A `Handler::tick` that waited, such as one making a key change while
   another connection's was held up by a PIN prompt, stopped `serve` from
   accepting connections until it returned. Ticks now run on a thread of

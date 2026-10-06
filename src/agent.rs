@@ -15,7 +15,6 @@ use arc_swap::ArcSwap;
 use ssh_encoding::Decode;
 use ssh_key::{HashAlg, PublicKey};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
@@ -106,11 +105,10 @@ pub struct Agent {
     /// `ssh-agent -t` does; `None` keeps them until removed.
     default_lifetime: Option<u32>,
     /// Wrong unlock passphrases since the last good one, which slow down
-    /// each further failure (see [`Self::handle_unlock`]).
-    unlock_failures: AtomicU32,
-    /// Held through each unlock attempt and its delay, so guesses are taken
-    /// one at a time however many connections send them.
-    unlock_turn: Mutex<()>,
+    /// each further failure (see [`Self::handle_unlock`]). Held through each
+    /// unlock attempt and its delay, so guesses are taken one at a time
+    /// however many connections send them.
+    unlock_failures: Mutex<u32>,
     /// Delay added per recorded failure.
     unlock_backoff: Duration,
 }
@@ -165,12 +163,20 @@ struct HeldKey {
     meta: KeyMeta,
 }
 
+/// An identity a listing found, before the policy is asked about it.
+struct Listing {
+    listed: wire::Listed,
+    /// The key, or the key that signs for `cert`.
+    key: SignerRef,
+    cert: Option<CertKey>,
+}
+
 /// Where an identity's `ssh-add -c`/`-h` constraints are kept.
 enum Constraints {
     /// On the entry `ssh-add FILE` added, as found in a snapshot.
     Own(KeyMeta),
-    /// In [`Store::provider_meta`], under the blob of the backend key that
-    /// signs, which is looked up outside the snapshot.
+    /// Those of the backend key that signs, by its blob (see
+    /// [`Store::backend_meta`]); the key is looked up outside the snapshot.
     Provider(Vec<u8>),
 }
 
@@ -299,10 +305,30 @@ impl Store {
     fn resolve(&self, constraints: Constraints) -> KeyMeta {
         match constraints {
             Constraints::Own(meta) => meta,
-            Constraints::Provider(blob) => {
-                self.provider_meta.get(&blob).cloned().unwrap_or_default()
-            }
+            Constraints::Provider(blob) => self.backend_meta(&blob),
         }
+    }
+
+    /// The constraints of the backend key `key_blob`: those it was added
+    /// with by `ssh-add FILE` too, if it was, else those of `ssh-add -s`.
+    /// A backend serving the same key does not lift its `-c`/`-h`.
+    fn backend_meta(&self, key_blob: &[u8]) -> KeyMeta {
+        match self.held_key(key_blob) {
+            Some(held) => held.meta.clone(),
+            None => self
+                .provider_meta
+                .get(key_blob)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether a backend key's constraints may differ between this snapshot
+    /// and `other`: false only when neither the added keys nor the provider
+    /// constraints were replaced.
+    fn backend_meta_may_differ(&self, other: &Store) -> bool {
+        !(Arc::ptr_eq(&self.provider_meta, &other.provider_meta)
+            && Arc::ptr_eq(&self.held, &other.held))
     }
 
     fn clear(&mut self) {
@@ -332,8 +358,7 @@ impl Agent {
             lifecycle: Vec::new(),
             locker: Arc::new(PassphraseLock::default()),
             default_lifetime: None,
-            unlock_failures: AtomicU32::new(0),
-            unlock_turn: Mutex::new(()),
+            unlock_failures: Mutex::new(0),
             unlock_backoff: UNLOCK_BACKOFF,
         }
     }
@@ -453,19 +478,16 @@ impl Agent {
         lifetime: Option<u32>,
         meta: KeyMeta,
     ) {
-        let identity = cert.map(|cert| held_cert(key.clone(), cert, meta.clone()));
-        self.write(|store| match &identity {
-            Some(identity) => store.push_cert(identity.clone(), lifetime),
-            None => store.hold(
-                HeldKey {
-                    key: key.clone(),
-                    meta: meta.clone(),
-                },
-                lifetime,
-            ),
-        });
-        if identity.is_none() {
-            tracing::info!(comment = key.comment(), "serving added key");
+        match cert {
+            Some(cert) => {
+                let identity = held_cert(key, cert, meta);
+                self.write(|store| store.push_cert(identity.clone(), lifetime));
+            }
+            None => {
+                tracing::info!(comment = key.comment(), "serving added key");
+                let held = HeldKey { key, meta };
+                self.write(|store| store.hold(held.clone(), lifetime));
+            }
         }
     }
 
@@ -624,18 +646,25 @@ impl Agent {
     /// a listing during which a listed key's constraints changed is taken
     /// again; if they keep changing, none is listed rather than one its
     /// constraints might hide. Other keys' constraints may change freely.
+    /// The policy is asked once, about the listing finally taken.
     pub fn identities_for(&self, connection: &Connection) -> Vec<wire::Listed> {
         for _ in 0..LOOKUP_ATTEMPTS {
             let before = self.snapshot();
             let mut consulted = Vec::new();
             let listed = self.list_identities(&before, connection, &mut consulted);
             let after = self.snapshot();
-            if Arc::ptr_eq(&before.provider_meta, &after.provider_meta)
+            if !before.backend_meta_may_differ(&after)
                 || consulted
                     .iter()
-                    .all(|blob| before.provider_meta.get(blob) == after.provider_meta.get(blob))
+                    .all(|blob| before.backend_meta(blob) == after.backend_meta(blob))
             {
-                return listed;
+                return listed
+                    .into_iter()
+                    .filter(|c| {
+                        self.listing_allowed(c.key.public_key(), c.cert.as_ref(), connection)
+                    })
+                    .map(|c| c.listed)
+                    .collect();
             }
             tracing::debug!("key constraints changed during the listing");
         }
@@ -644,30 +673,36 @@ impl Agent {
     }
 
     /// One pass of [`Self::identities_for`] over `store`, which may be out
-    /// of date by the time the backends answer. The blobs whose
-    /// [`Store::provider_meta`] it read go in `consulted`.
+    /// of date by the time the backends answer: the identities whose
+    /// constraints permit this connection, before the policy is asked. The
+    /// backend keys whose constraints it read go in `consulted`.
     fn list_identities(
         &self,
         store: &Store,
         connection: &Connection,
         consulted: &mut Vec<Vec<u8>>,
-    ) -> Vec<wire::Listed> {
+    ) -> Vec<Listing> {
         let mut out = Vec::new();
         self.purge_backends();
         for key in self.backends.iter().flat_map(|b| b.identities()) {
             let blob = key.key_blob();
             let meta = store.resolve(Constraints::Provider(blob.clone()));
             consulted.push(blob);
-            if permitted(&meta, connection)
-                && self.listing_allowed(key.public_key(), None, connection)
-            {
-                out.push(wire::listed(key.public_key()));
+            if permitted(&meta, connection) {
+                out.push(Listing {
+                    listed: wire::listed(key.public_key()),
+                    key,
+                    cert: None,
+                });
             }
         }
         for held in store.held.iter().filter(|e| !e.expired()).map(|e| &e.item) {
-            let key = held.key.public_key();
-            if permitted(&held.meta, connection) && self.listing_allowed(key, None, connection) {
-                out.push(wire::listed(key));
+            if permitted(&held.meta, connection) {
+                out.push(Listing {
+                    listed: wire::listed(held.key.public_key()),
+                    key: held.key.clone(),
+                    cert: None,
+                });
             }
         }
         for identity in store.certs.iter().filter(|e| !e.expired()).map(|e| &e.item) {
@@ -684,10 +719,12 @@ impl Agent {
             if let Constraints::Provider(blob) = &constraints {
                 consulted.push(blob.clone());
             }
-            if permitted(&store.resolve(constraints), connection)
-                && self.listing_allowed(signer.public_key(), Some(&identity.cert), connection)
-            {
-                out.push((identity.cert.blob().to_vec(), identity.comment.clone()));
+            if permitted(&store.resolve(constraints), connection) {
+                out.push(Listing {
+                    listed: (identity.cert.blob().to_vec(), identity.comment.clone()),
+                    key: signer,
+                    cert: Some(identity.cert.clone()),
+                });
             }
         }
         out
@@ -878,7 +915,12 @@ impl Agent {
                 if !self.manage_allowed(change, connection) {
                     return wire::failure();
                 }
-                let blob = key.key_blob();
+                // The identity this add replaces: a certificate is
+                // constrained apart from its key.
+                let blob = match &cert {
+                    Some(cert) => cert.blob().to_vec(),
+                    None => key.key_blob(),
+                };
                 if !self.may_manage(&blob, connection) {
                     tracing::warn!("refused: key not permitted on this connection");
                     return wire::failure();
@@ -1098,19 +1140,19 @@ impl Agent {
         }
         // Held through the delay, so guesses are taken one at a time however
         // many connections send them.
-        let _turn = lock(&self.unlock_turn);
+        let mut failures = lock(&self.unlock_failures);
         if self.unlock(passphrase) {
-            self.unlock_failures.store(0, Ordering::SeqCst);
+            *failures = 0;
             tracing::info!("agent unlocked");
             return wire::success();
         }
-        let increment = |n: u32| Some((n + 1).min(MAX_UNLOCK_FAILURES));
-        let (Ok(previous) | Err(previous)) =
-            self.unlock_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, increment);
-        let failures = (previous + 1).min(MAX_UNLOCK_FAILURES);
-        let delay = self.unlock_backoff * failures;
-        tracing::warn!(failures, ?delay, "unlock request refused: wrong passphrase");
+        *failures = (*failures + 1).min(MAX_UNLOCK_FAILURES);
+        let delay = self.unlock_backoff * *failures;
+        tracing::warn!(
+            failures = *failures,
+            ?delay,
+            "unlock request refused: wrong passphrase"
+        );
         std::thread::sleep(delay);
         wire::failure()
     }
@@ -1186,19 +1228,29 @@ impl Agent {
     /// Record `meta` for the key `blob` before `publish` serves it, so a sign
     /// on another connection never finds the key without its constraints.
     /// If publishing fails, the key's previous constraints are put back.
+    ///
+    /// A key already served under constraints keeps them until `publish`
+    /// succeeds, so constraints that would lift some never take effect
+    /// while it runs (a PIN prompt, say) or after it fails.
     fn publish_constrained<T>(
         &self,
         blob: Vec<u8>,
         meta: KeyMeta,
         publish: impl FnOnce() -> Result<T, AgentError>,
     ) -> Result<T, AgentError> {
-        let previous = self.write(|store| {
+        let served = self.backend_key(&blob).is_some();
+        let (previous, deferred) = self.write(|store| {
             let previous = store.provider_meta.get(&blob).cloned();
-            store.set_provider_meta(blob.clone(), meta.clone());
-            previous
+            let deferred = served && previous.is_some();
+            if !deferred {
+                store.set_provider_meta(blob.clone(), meta.clone());
+            }
+            (previous, deferred)
         });
         let published = publish();
-        if published.is_err() {
+        if published.is_ok() && deferred {
+            self.write(|store| store.set_provider_meta(blob.clone(), meta.clone()));
+        } else if published.is_err() && !deferred {
             // Unless something else, such as a backend's `release`, changed
             // them meanwhile.
             let ours = (!meta.is_empty()).then_some(&meta);
@@ -1335,11 +1387,9 @@ impl Agent {
                 (signer, Constraints::Provider(blob)) => (signer, blob),
             };
             let after = self.snapshot();
-            let meta = after.provider_meta.get(&blob);
-            if Arc::ptr_eq(&before.provider_meta, &after.provider_meta)
-                || before.provider_meta.get(&blob) == meta
-            {
-                return Ok((signer, meta.cloned().unwrap_or_default()));
+            let meta = after.backend_meta(&blob);
+            if !before.backend_meta_may_differ(&after) || before.backend_meta(&blob) == meta {
+                return Ok((signer, meta));
             }
             tracing::debug!("key constraints changed during the lookup");
         }
@@ -1407,6 +1457,7 @@ fn session_bind(data: &[u8], connection: &mut Connection) -> Result<(), destinat
 mod tests {
     use super::*;
     use ssh_encoding::Encode;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     fn local_key(seed: u8, comment: &str) -> (Vec<u8>, PublicKey) {
@@ -1425,16 +1476,11 @@ mod tests {
     fn the_unlock_failure_count_saturates() {
         let agent = Agent::new().with_unlock_backoff(Duration::ZERO);
         assert!(agent.lock(b"hunter2"));
-        agent
-            .unlock_failures
-            .store(MAX_UNLOCK_FAILURES, Ordering::SeqCst);
+        *agent.unlock_failures.lock().unwrap() = MAX_UNLOCK_FAILURES;
         let mut wrong = vec![wire::SSH_AGENTC_UNLOCK];
         b"hunter3".as_slice().encode(&mut wrong).unwrap();
         assert_eq!(agent.handle(&wrong), wire::failure());
-        assert_eq!(
-            agent.unlock_failures.load(Ordering::SeqCst),
-            MAX_UNLOCK_FAILURES
-        );
+        assert_eq!(*agent.unlock_failures.lock().unwrap(), MAX_UNLOCK_FAILURES);
     }
 
     /// Each wrong unlock passphrase waits longer than the last; the right one
@@ -1450,13 +1496,13 @@ mod tests {
             let started = Instant::now();
             assert_eq!(agent.handle(&wrong), wire::failure());
             assert!(started.elapsed() >= Duration::from_millis(20) * failures);
-            assert_eq!(agent.unlock_failures.load(Ordering::SeqCst), failures);
+            assert_eq!(*agent.unlock_failures.lock().unwrap(), failures);
         }
 
         let mut right = vec![wire::SSH_AGENTC_UNLOCK];
         b"hunter2".as_slice().encode(&mut right).unwrap();
         assert_eq!(agent.handle(&right), wire::success());
-        assert_eq!(agent.unlock_failures.load(Ordering::SeqCst), 0);
+        assert_eq!(*agent.unlock_failures.lock().unwrap(), 0);
     }
 
     /// Guesses sent on parallel connections wait their turn, so more
@@ -2633,5 +2679,120 @@ mod tests {
             *log.0.lock().unwrap(),
             vec!["locked", "unlocked", "cleared"]
         );
+    }
+
+    /// An `ssh-add -h` certificate cannot be replaced, constraints and all,
+    /// from a connection its constraint rules out, even when its plain key
+    /// was never added.
+    #[test]
+    fn a_constrained_certificate_is_not_replaced_from_a_hidden_connection() {
+        use ssh_key::private::Ed25519Keypair;
+        let pair = Ed25519Keypair::from_seed(&[0x30; 32]);
+        let cert = crate::testing::certify(&ssh_key::public::KeyData::Ed25519(pair.public));
+        let mut private = Vec::new();
+        pair.encode(&mut private).unwrap();
+        let mut add = vec![wire::SSH2_AGENTC_ADD_IDENTITY];
+        "ssh-ed25519-cert-v01@openssh.com".encode(&mut add).unwrap();
+        add.extend_from_slice(&crate::testing::cert_body(&cert, &private, "cert"));
+        let mut constrained = add.clone();
+        constrained[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        constrained.extend_from_slice(&wire::tests::destination_extension());
+
+        let agent = Agent::new();
+        assert_eq!(agent.handle(&constrained), wire::success());
+        let mut poisoned = Connection::default();
+        let _ = poisoned.bind(
+            ed25519(0x33, "host").public_key().clone(),
+            b"sid",
+            b"not a signature",
+            false,
+        );
+        assert_eq!(agent.handle_in(&add, &mut poisoned), wire::failure());
+        assert!(
+            agent.identities_for(&poisoned).is_empty(),
+            "the certificate lost its constraint"
+        );
+    }
+
+    /// A key a backend serves and `ssh-add -c` added too signs only with a
+    /// confirmation, whichever copy is found first.
+    #[test]
+    fn a_backend_copy_keeps_the_added_keys_constraints() {
+        let key = ed25519(0x31, "both@example.com");
+        let agent =
+            Agent::new().with_backend(Arc::new(crate::testing::MemoryBackend::new([key.clone()])));
+        let (mut add, _) = local_key(0x31, "both@example.com");
+        add[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        assert_eq!(agent.handle(&add), wire::success());
+        assert!(matches!(
+            agent.sign(&key.key_blob(), b"data", 0, &Connection::default()),
+            Err(AgentError::ConfirmRefused)
+        ));
+    }
+
+    /// Re-adding a served `ssh-add -s -c` key without `-c` keeps the
+    /// confirmation while the provider adds it, and lifts it only after.
+    #[test]
+    fn looser_provider_constraints_wait_for_the_add() {
+        struct Checking {
+            key: SignerRef,
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            confirmed_during: std::sync::atomic::AtomicBool,
+        }
+        impl SmartcardProvider for Checking {
+            fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+                Ok(self.key.clone())
+            }
+            fn add(
+                &self,
+                _: &[u8],
+                _: &Zeroizing<Vec<u8>>,
+                _: Option<u32>,
+            ) -> Result<(), BoxError> {
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                let (_, meta) = agent.constrained_signer(&self.key.key_blob()).unwrap();
+                self.confirmed_during.store(meta.confirm, Ordering::SeqCst);
+                Ok(())
+            }
+            fn remove(&self, _: &[u8]) -> Result<crate::Removed, BoxError> {
+                Ok(crate::Removed::default())
+            }
+        }
+
+        let key = ed25519(0x32, "card");
+        let provider = Arc::new(Checking {
+            key: key.clone(),
+            agent: std::sync::OnceLock::new(),
+            confirmed_during: Default::default(),
+        });
+        let agent = Arc::new(
+            Agent::new()
+                .with_backend(Arc::new(crate::testing::MemoryBackend::new([key.clone()])))
+                .with_smartcard(Arc::clone(&provider) as _),
+        );
+        let _ = provider.agent.set(Arc::downgrade(&agent));
+        let confirm = KeyMeta {
+            confirm: true,
+            destination: Vec::new(),
+        };
+        agent.write(|store| store.set_provider_meta(key.key_blob(), confirm.clone()));
+
+        let pin = Zeroizing::new(Vec::new());
+        agent
+            .add_smartcard(
+                b"card",
+                &pin,
+                None,
+                KeyMeta::default(),
+                None,
+                &Connection::default(),
+            )
+            .unwrap();
+        assert!(
+            provider.confirmed_during.load(Ordering::SeqCst),
+            "the confirmation was lifted before the add finished"
+        );
+        assert_eq!(agent.snapshot().provider_meta.get(&key.key_blob()), None);
     }
 }
