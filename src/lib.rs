@@ -66,7 +66,9 @@ pub use local::{
     EcdsaLocalKey, Ed25519LocalKey, LocalKey, LocalKeyError, LocalKeyRef, RsaLocalKey,
 };
 pub use lock::{Locker, PassphraseLock};
-pub use policy::{Confirm, ConfirmRequest, Policy, SignInfo};
+pub use policy::{
+    Confirm, ConfirmRequest, KeyChange, KeyConstraints, ManageInfo, Policy, SignInfo,
+};
 pub use server::{
     Handler, Listener, SocketError, SocketGuard, Stream, bind_socket, default_socket_path,
     ephemeral_socket_path, handle_connection, serve,

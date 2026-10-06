@@ -6,7 +6,9 @@ use crate::destination::{self, Connection, DestinationConstraint};
 use crate::extension::{Extension, ExtensionContext};
 use crate::keytype::{KeyDecoder, KeyRegistry};
 use crate::lock::{Locker, PassphraseLock};
-use crate::policy::{Confirm, ConfirmRequest, Policy, SignInfo};
+use crate::policy::{
+    Confirm, ConfirmRequest, KeyChange, KeyConstraints, ManageInfo, Policy, SignInfo,
+};
 use crate::signer::{BoxError, SignerRef, VerifyError};
 use crate::wire::{self, Request};
 use ssh_encoding::Decode;
@@ -547,14 +549,15 @@ impl Agent {
         }
     }
 
-    /// Whether the policy lets this connection change keys.
-    fn manage_allowed(&self, connection: &Connection) -> bool {
+    /// Whether the policy allows `change` on this connection.
+    fn manage_allowed(&self, change: KeyChange<'_>, connection: &Connection) -> bool {
+        let request = ManageInfo { change, connection };
         let allowed = self
             .policy
             .as_ref()
-            .is_none_or(|p| p.allow_manage(connection));
+            .is_none_or(|p| p.allow_manage(&request));
         if !allowed {
-            tracing::warn!("refused: the policy forbids key changes on this connection");
+            tracing::warn!("refused: the policy forbids this key change");
         }
         allowed
     }
@@ -595,7 +598,6 @@ impl Agent {
                 }
             }
             Request::Unlock(passphrase) => self.handle_unlock(&passphrase),
-            _ if request.changes_keys() && !self.manage_allowed(connection) => wire::failure(),
             Request::AddIdentity {
                 key,
                 cert,
@@ -603,12 +605,24 @@ impl Agent {
                 confirm,
                 destination,
             } => {
+                let lifetime = self.lifetime_for(lifetime);
+                let change = KeyChange::Add {
+                    key: key.public_key(),
+                    certificate: cert.as_deref(),
+                    constraints: KeyConstraints {
+                        lifetime,
+                        confirm,
+                        destination: &destination,
+                    },
+                };
+                if !self.manage_allowed(change, connection) {
+                    return wire::failure();
+                }
                 let blob = key.key_blob();
                 if !self.may_manage(&blob, connection) {
                     tracing::warn!("refused: key not permitted on this connection");
                     return wire::failure();
                 }
-                let lifetime = self.lifetime_for(lifetime);
                 let meta = KeyMeta {
                     confirm,
                     destination,
@@ -623,6 +637,14 @@ impl Agent {
                 wire::success()
             }
             Request::RemoveIdentity { key_blob } => {
+                let target = self.signer_for(&key_blob).ok();
+                let change = KeyChange::Remove {
+                    key_blob: &key_blob,
+                    key: target.as_ref().map(|t| t.public_key()),
+                };
+                if !self.manage_allowed(change, connection) {
+                    return wire::failure();
+                }
                 if !self.may_manage(&key_blob, connection) {
                     tracing::warn!("refused: key not permitted on this connection");
                     return wire::failure();
@@ -650,6 +672,9 @@ impl Agent {
                 }
             }
             Request::RemoveAllIdentities => {
+                if !self.manage_allowed(KeyChange::RemoveAll, connection) {
+                    return wire::failure();
+                }
                 self.remove_all();
                 tracing::info!("removed every identity");
                 wire::success()
@@ -675,7 +700,7 @@ impl Agent {
                     confirm,
                     destination,
                 };
-                match self.add_smartcard(&provider, &pin, lifetime, meta, certs) {
+                match self.add_smartcard(&provider, &pin, lifetime, meta, certs, connection) {
                     Ok(()) => wire::success(),
                     Err(e) => {
                         tracing::warn!(error = %e, "cannot add provider key");
@@ -683,20 +708,28 @@ impl Agent {
                     }
                 }
             }
-            Request::RemoveSmartcardKey { provider } => match self.remove_smartcard(&provider) {
-                Ok(true) => {
-                    tracing::info!("removed provider key");
-                    wire::success()
+            Request::RemoveSmartcardKey { provider } => {
+                let change = KeyChange::RemoveProvider {
+                    provider: &provider,
+                };
+                if !self.manage_allowed(change, connection) {
+                    return wire::failure();
                 }
-                Ok(false) => {
-                    tracing::debug!("no such provider key to remove");
-                    wire::failure()
+                match self.remove_smartcard(&provider) {
+                    Ok(true) => {
+                        tracing::info!("removed provider key");
+                        wire::success()
+                    }
+                    Ok(false) => {
+                        tracing::debug!("no such provider key to remove");
+                        wire::failure()
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot remove provider key");
+                        wire::failure()
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot remove provider key");
-                    wire::failure()
-                }
-            },
+            }
             Request::Extension { name, data } => self.handle_extension(&name, &data, connection),
             Request::Unsupported(kind) => {
                 tracing::debug!(kind, "unsupported request");
@@ -708,7 +741,8 @@ impl Agent {
     /// `ssh-add -s PROVIDER [CERT…]`: serve the key the provider names
     /// (unless `ssh-add -C` asked for its certificates only) and the given
     /// certificates that certify it; the others are skipped. Fails when only
-    /// certificates were asked for and none certifies the key.
+    /// certificates were asked for and none certifies the key. The policy is
+    /// asked once the key is fetched, so it can decide by the key.
     fn add_smartcard(
         &self,
         provider: &[u8],
@@ -716,6 +750,7 @@ impl Agent {
         lifetime: Option<u32>,
         meta: KeyMeta,
         certs: Option<AssociatedCerts>,
+        connection: &Connection,
     ) -> Result<(), AgentError> {
         let source = self
             .smartcard
@@ -725,8 +760,22 @@ impl Agent {
         self.purge_expired();
         // Fetch the key first: its blob names the constraints.
         let key = source.resolve(provider, pin).map_err(AgentError::Backend)?;
+        let certs_only = certs.as_ref().is_some_and(|c| c.certs_only);
+        let change = KeyChange::AddProvider {
+            provider,
+            key: key.public_key(),
+            certificates: certs.as_ref().map_or(&[], |c| c.certs.as_slice()),
+            certificates_only: certs_only,
+            constraints: KeyConstraints {
+                lifetime,
+                confirm: meta.confirm,
+                destination: &meta.destination,
+            },
+        };
+        if !self.manage_allowed(change, connection) {
+            return Err(AgentError::PolicyRefused);
+        }
         self.publish_constrained(key.key_blob(), meta, || {
-            let certs_only = certs.as_ref().is_some_and(|c| c.certs_only);
             if !certs_only {
                 source
                     .add(provider, pin, lifetime)
@@ -1399,8 +1448,8 @@ mod tests {
                     .unwrap()
                     .push(request.key.comment().to_owned());
             }
-            fn allow_manage(&self, connection: &Connection) -> bool {
-                !connection.bind_attempted()
+            fn allow_manage(&self, request: &ManageInfo<'_>) -> bool {
+                !request.connection.bind_attempted()
             }
         }
         let policy = Arc::new(OnlyTagged::default());
@@ -1453,48 +1502,49 @@ mod tests {
         assert_eq!(confirm.requests.lock().unwrap().len(), 1);
     }
 
+    /// A smartcard provider that serves one key, named `card`, and is the
+    /// backend that lists it.
+    struct Card(crate::testing::MemoryBackend, SignerRef);
+    impl SmartcardProvider for Card {
+        fn resolve(
+            &self,
+            provider: &[u8],
+            _pin: &Zeroizing<Vec<u8>>,
+        ) -> Result<SignerRef, BoxError> {
+            match provider {
+                b"card" => Ok(self.1.clone()),
+                _ => Err("no such card".into()),
+            }
+        }
+        fn add(
+            &self,
+            provider: &[u8],
+            pin: &Zeroizing<Vec<u8>>,
+            _lifetime: Option<u32>,
+        ) -> Result<(), BoxError> {
+            let key = self.resolve(provider, pin)?;
+            self.0.0.lock().unwrap().push(key);
+            Ok(())
+        }
+        fn remove(&self, provider: &[u8]) -> Result<crate::Removed, BoxError> {
+            let key = self.resolve(provider, &Zeroizing::new(Vec::new()))?;
+            Ok(crate::Removed {
+                served: Backend::remove(&self.0, &key.key_blob()),
+                key_blob: Some(key.key_blob()),
+            })
+        }
+    }
+    impl Backend for Card {
+        fn identities(&self) -> Vec<SignerRef> {
+            self.0.identities()
+        }
+    }
+
     /// `ssh-add -s`/`-e` reach the smartcard provider, which owns the key;
     /// without one they fail.
     #[test]
     fn smartcard_requests_reach_the_provider() {
-        use crate::testing::MemoryBackend;
-        struct Card(MemoryBackend, SignerRef);
-        impl SmartcardProvider for Card {
-            fn resolve(
-                &self,
-                provider: &[u8],
-                _pin: &Zeroizing<Vec<u8>>,
-            ) -> Result<SignerRef, BoxError> {
-                match provider {
-                    b"card" => Ok(self.1.clone()),
-                    _ => Err("no such card".into()),
-                }
-            }
-            fn add(
-                &self,
-                provider: &[u8],
-                pin: &Zeroizing<Vec<u8>>,
-                _lifetime: Option<u32>,
-            ) -> Result<(), BoxError> {
-                let key = self.resolve(provider, pin)?;
-                self.0.0.lock().unwrap().push(key);
-                Ok(())
-            }
-            fn remove(&self, provider: &[u8]) -> Result<crate::Removed, BoxError> {
-                let key = self.resolve(provider, &Zeroizing::new(Vec::new()))?;
-                Ok(crate::Removed {
-                    served: Backend::remove(&self.0, &key.key_blob()),
-                    key_blob: Some(key.key_blob()),
-                })
-            }
-        }
-        impl Backend for Card {
-            fn identities(&self) -> Vec<SignerRef> {
-                self.0.identities()
-            }
-        }
-
-        let card = Arc::new(Card(MemoryBackend::default(), ed25519(7, "card")));
+        let card = Arc::new(Card(Default::default(), ed25519(7, "card")));
         let agent = Agent::new()
             .with_backend(Arc::clone(&card) as _)
             .with_smartcard(Arc::clone(&card) as _);
@@ -1517,6 +1567,118 @@ mod tests {
         assert_eq!(agent.handle(&remove), wire::failure());
 
         assert_eq!(Agent::new().handle(&add), wire::failure());
+    }
+
+    /// `allow_manage` sees each change with its key: the key to add and its
+    /// constraints, the served key a removal names, and the key a provider
+    /// resolved. A refusal leaves the keys as they were.
+    #[test]
+    fn the_policy_sees_each_key_change() {
+        #[derive(Default)]
+        struct Record(Mutex<Vec<String>>, std::sync::atomic::AtomicBool);
+        impl Policy for Record {
+            fn allow_manage(&self, request: &ManageInfo<'_>) -> bool {
+                let key = request.key().map_or("-", |k| k.comment()).to_owned();
+                let line = match request.change {
+                    KeyChange::Add {
+                        certificate,
+                        constraints,
+                        ..
+                    } => format!(
+                        "add {key} cert={} life={:?} confirm={}",
+                        certificate.is_some(),
+                        constraints.lifetime,
+                        constraints.confirm
+                    ),
+                    KeyChange::Remove { key_blob, .. } => {
+                        format!("remove {key} ({} bytes)", key_blob.len())
+                    }
+                    KeyChange::RemoveAll => "remove-all".to_owned(),
+                    KeyChange::AddProvider {
+                        provider,
+                        certificates_only,
+                        ..
+                    } => format!(
+                        "add-provider {} -> {key} certs_only={certificates_only}",
+                        String::from_utf8_lossy(provider)
+                    ),
+                    KeyChange::RemoveProvider { provider } => {
+                        format!("remove-provider {}", String::from_utf8_lossy(provider))
+                    }
+                };
+                self.0.lock().unwrap().push(line);
+                !self.1.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+
+        let policy = Arc::new(Record::default());
+        let card = Arc::new(Card(Default::default(), ed25519(7, "card")));
+        let agent = Agent::new()
+            .with_default_lifetime(Some(600))
+            .with_policy(Arc::clone(&policy) as _)
+            .with_backend(Arc::clone(&card) as _)
+            .with_smartcard(Arc::clone(&card) as _);
+
+        let (mut add, public) = local_key(1, "ferris@example.com");
+        add[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        assert_eq!(agent.handle(&add), wire::success());
+        let mut remove = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        public.to_bytes().unwrap().encode(&mut remove).unwrap();
+        let provider = |kind: u8| {
+            let mut body = vec![kind];
+            b"card".as_slice().encode(&mut body).unwrap();
+            b"".as_slice().encode(&mut body).unwrap();
+            body
+        };
+
+        // Refused: nothing changes.
+        policy.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(agent.handle(&remove), wire::failure());
+        assert_eq!(
+            agent.handle(&provider(wire::SSH_AGENTC_ADD_SMARTCARD_KEY)),
+            wire::failure()
+        );
+        assert_eq!(
+            agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]),
+            wire::failure()
+        );
+        assert_eq!(agent.public_keys(), vec![public.clone()]);
+
+        // Allowed.
+        policy.1.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            agent.handle(&provider(wire::SSH_AGENTC_ADD_SMARTCARD_KEY)),
+            wire::success()
+        );
+        assert_eq!(
+            agent.handle(&provider(wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY)),
+            wire::success()
+        );
+        assert_eq!(agent.handle(&remove), wire::success());
+        let mut unknown = vec![wire::SSH2_AGENTC_REMOVE_IDENTITY];
+        b"not a key".as_slice().encode(&mut unknown).unwrap();
+        assert_eq!(agent.handle(&unknown), wire::failure());
+        assert_eq!(
+            agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]),
+            wire::success()
+        );
+
+        let blob_len = public.to_bytes().unwrap().len();
+        assert_eq!(
+            *policy.0.lock().unwrap(),
+            vec![
+                "add ferris@example.com cert=false life=Some(600) confirm=true".to_owned(),
+                format!("remove ferris@example.com ({blob_len} bytes)"),
+                "add-provider card -> card certs_only=false".to_owned(),
+                "remove-all".to_owned(),
+                "add-provider card -> card certs_only=false".to_owned(),
+                "remove-provider card".to_owned(),
+                format!("remove ferris@example.com ({blob_len} bytes)"),
+                "remove - (9 bytes)".to_owned(),
+                "remove-all".to_owned(),
+            ]
+        );
     }
 
     /// Lifecycle hooks hear lock, unlock and `ssh-add -D`.

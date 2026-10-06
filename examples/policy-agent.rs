@@ -20,7 +20,7 @@
 //! ```
 
 use ssh_agent_kit::wire::{SignedData, classify_data};
-use ssh_agent_kit::{Agent, Connection, Policy, SignInfo, bind_socket, serve};
+use ssh_agent_kit::{Agent, Connection, ManageInfo, Policy, SignInfo, bind_socket, serve};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -64,8 +64,13 @@ impl Policy for Rules {
         );
     }
 
-    fn allow_manage(&self, connection: &Connection) -> bool {
-        !forwarded(connection)
+    fn allow_manage(&self, request: &ManageInfo<'_>) -> bool {
+        if forwarded(request.connection) {
+            let key = request.key().map_or("all keys", |k| k.comment());
+            eprintln!("refused a key change for {key}: forwarded connection");
+            return false;
+        }
+        true
     }
 }
 
