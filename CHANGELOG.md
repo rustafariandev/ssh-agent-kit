@@ -35,9 +35,12 @@ follows [Semantic Versioning](https://semver.org/).
   served under constraints, replaced the key's constraints, so the key and
   its certificates signed without them. Such certificates now take the
   key's constraints, and the key keeps them.
-- A backend that dropped an `ssh-add -s -c`/`-h` key while its
-  certificates were being added left them served without its constraints.
-  They are now refused with it.
+- A backend that dropped an `ssh-add -s` key while its certificates were
+  being added left them served, through a key no backend served and
+  without its `-c`/`-h`. They are now refused with it.
+- A backend that released an `ssh-add -s -c`/`-h` key while re-serving it
+  for the add took its constraints, so the key signed without them once
+  added. They are now recorded again when the add succeeds.
 - A key change that waited for another connection's, such as one held up
   by a PIN prompt, still ran if the agent was locked meanwhile. It is now
   refused.
