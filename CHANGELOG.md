@@ -27,6 +27,10 @@ follows [Semantic Versioning](https://semver.org/).
   `ssh-add -c key` and `ssh-add key-cert.pub`, the key signed without
   asking. Each now keeps the constraints it was added with, as in OpenSSH.
   Keys added with `ssh-add -s` still share theirs with their certificates.
+- A `Handler::tick` that waited, such as one making a key change while
+  another connection's was held up by a PIN prompt, stopped `serve` from
+  accepting connections until it returned. Ticks now run on a thread of
+  their own.
 
 ### Changed
 
@@ -35,6 +39,9 @@ follows [Semantic Versioning](https://semver.org/).
   change replaces with a changed copy. Extensions and key types are
   registered the same way. Expired keys are skipped by reads and dropped
   by the next change or by the server's once-a-second tick.
+- Every `Backend` method, not only `remove` and `remove_all`, is documented
+  as possibly called while key changes are taken one at a time, since a key
+  change looks up and purges backend keys too.
 
 ## [0.1.0] - 2026-10-04
 

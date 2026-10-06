@@ -28,6 +28,9 @@ pub trait Handler: Send + Sync + 'static {
 
     /// Called about once a second while serving, so time-limited state
     /// (keys added with `ssh-add -t`) is dropped even when no client talks.
+    /// Runs on a thread of its own, so it may wait, such as for a key change
+    /// another connection is making, without holding up the server; the
+    /// next tick comes once it returns.
     fn tick(&self) {}
 }
 
@@ -189,24 +192,24 @@ impl Drop for ConnectionSlot {
     }
 }
 
+/// How often the accept loop, and the ticker between ticks, look for new
+/// work and for the server stopping.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// Accept connections until `shutdown` is set. Each connection runs on its
 /// own thread, after its peer passes [`Stream::peer_allowed`]. The handler
-/// is ticked about once a second.
+/// is ticked about once a second on a thread of its own, so a tick that
+/// waits, such as on a key change held up by a PIN prompt, never stops
+/// connections from being accepted.
 pub fn serve<L: Listener, H: Handler>(
     listener: L,
     handler: Arc<H>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     listener.start()?;
-    let mut last_purge = Instant::now();
+    let _ticker = spawn_ticker(Arc::clone(&handler));
     let active = Arc::new(AtomicUsize::new(0));
     while !shutdown.load(Ordering::SeqCst) {
-        // Drop keys whose `ssh-add -t` lifetime has run out even when no
-        // client is talking to the agent, so their secrets do not linger.
-        if last_purge.elapsed() >= PURGE_INTERVAL {
-            handler.tick();
-            last_purge = Instant::now();
-        }
         match listener.accept() {
             Ok(stream) => {
                 if !stream.peer_allowed() {
@@ -226,12 +229,42 @@ pub fn serve<L: Listener, H: Handler>(
                 });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(POLL_INTERVAL);
             }
             Err(e) => return Err(e),
         }
     }
     Ok(())
+}
+
+/// Stops the ticker [`spawn_ticker`] started when dropped, so it ends with
+/// [`serve`] however that returns.
+struct Ticker(Arc<AtomicBool>);
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Tick `handler` about once a second until the returned [`Ticker`] is
+/// dropped. Drops keys whose `ssh-add -t` lifetime has run out even when no
+/// client is talking to the agent, so their secrets do not linger. Not
+/// joined: a tick still running when the server stops finishes on its own.
+fn spawn_ticker<H: Handler>(handler: Arc<H>) -> Ticker {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&stopped);
+    std::thread::spawn(move || {
+        let mut last_tick = Instant::now();
+        while !stopped.load(Ordering::SeqCst) {
+            if last_tick.elapsed() >= PURGE_INTERVAL {
+                handler.tick();
+                last_tick = Instant::now();
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    });
+    Ticker(stop)
 }
 
 #[derive(Debug, Error)]
@@ -403,6 +436,56 @@ mod tests {
         // A stale socket is replaced.
         drop(UnixListener::bind(&path).unwrap());
         let (_l, _g) = bind_socket(&path).unwrap();
+    }
+
+    /// A tick that waits, as one making a key change waits for another
+    /// connection's, does not stop the server from accepting and answering
+    /// connections.
+    #[test]
+    fn a_waiting_tick_does_not_hold_up_connections() {
+        use std::sync::mpsc;
+
+        struct StuckTick {
+            ticked: Mutex<mpsc::Sender<()>>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Handler for StuckTick {
+            fn handle_in(&self, _body: &[u8], _connection: &mut Connection) -> Vec<u8> {
+                wire::success()
+            }
+            fn tick(&self) {
+                let _ = self.ticked.lock().unwrap().send(());
+                let _ = self.release.lock().unwrap().recv();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let (listener, _guard) = bind_socket(&path).unwrap();
+        let (ticked, tick_started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let handler = Arc::new(StuckTick {
+            ticked: Mutex::new(ticked),
+            release: Mutex::new(released),
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = {
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || serve(listener, handler, shutdown))
+        };
+
+        tick_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        wire::write_frame(&mut stream, &[wire::SSH2_AGENTC_REQUEST_IDENTITIES]).unwrap();
+        let reply = wire::read_frame(&mut stream).unwrap();
+        assert_eq!(reply, Some(wire::success()));
+
+        release.send(()).unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        server.join().unwrap().unwrap();
     }
 
     /// Sockets bound at the same time from many threads are all owner-only,

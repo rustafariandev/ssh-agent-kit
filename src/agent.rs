@@ -2346,6 +2346,75 @@ mod tests {
         assert_eq!(Agent::new().handle(&add), wire::failure());
     }
 
+    /// Listing and signing go on while a key change waits on the user,
+    /// such as for a PIN: only other key changes wait for it.
+    #[test]
+    fn reads_do_not_wait_for_a_key_change() {
+        use std::sync::mpsc;
+        struct Prompting {
+            key: SignerRef,
+            prompted: Mutex<mpsc::Sender<()>>,
+            answer: Mutex<mpsc::Receiver<()>>,
+        }
+        impl SmartcardProvider for Prompting {
+            fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+                let _ = self.prompted.lock().unwrap().send(());
+                let _ = self.answer.lock().unwrap().recv();
+                Ok(self.key.clone())
+            }
+            fn add(
+                &self,
+                _: &[u8],
+                _: &Zeroizing<Vec<u8>>,
+                _: Option<u32>,
+            ) -> Result<(), BoxError> {
+                Ok(())
+            }
+            fn remove(&self, _: &[u8]) -> Result<crate::Removed, BoxError> {
+                Ok(crate::Removed::default())
+            }
+        }
+
+        let (prompted, prompt) = mpsc::channel();
+        let (answer, answered) = mpsc::channel();
+        let provider = Prompting {
+            key: ed25519(0x2a, "card"),
+            prompted: Mutex::new(prompted),
+            answer: Mutex::new(answered),
+        };
+        let agent = Arc::new(Agent::new().with_smartcard(Arc::new(provider)));
+        let (add, public) = local_key(0x2b, "held@example.com");
+        assert_eq!(agent.handle(&add), wire::success());
+
+        let mut add_card = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY];
+        b"card".as_slice().encode(&mut add_card).unwrap();
+        b"".as_slice().encode(&mut add_card).unwrap();
+        let change = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || agent.handle(&add_card))
+        };
+        prompt.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (done, replies) = mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            let blob = public.to_bytes().unwrap();
+            std::thread::spawn(move || {
+                let listed = agent.identities().len();
+                let signed = agent.handle(&sign_body(&blob, b"data"))[0];
+                let _ = done.send((listed, signed));
+            });
+        }
+        let replies = replies.recv_timeout(Duration::from_secs(5));
+        answer.send(()).unwrap();
+        assert_eq!(
+            replies,
+            Ok((1, wire::SSH2_AGENT_SIGN_RESPONSE)),
+            "a read waited for the key change"
+        );
+        assert_eq!(change.join().unwrap(), wire::success());
+    }
+
     /// `allow_manage` sees each change with its key: the key to add and its
     /// constraints, the served key a removal names, and the key a provider
     /// resolved. A refusal leaves the keys as they were.

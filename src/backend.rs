@@ -18,6 +18,14 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 /// A source of identities the agent serves on its owner's behalf.
+///
+/// Every method may be called while the agent takes key changes one at a
+/// time, since a key change looks up, purges and removes backend keys: a
+/// request that changes keys (through [`Agent::handle`](crate::Agent::handle))
+/// made from one, or made on another thread while holding a lock one takes,
+/// waits for the current change to finish, so never returns.
+/// [`Agent::release`](crate::Agent::release) and the agent's other methods
+/// may be called.
 pub trait Backend: Send + Sync {
     /// Every identity to list, fetching what is not known yet (which may
     /// mean talking to a device). Keys that cannot be fetched are left out,
@@ -34,19 +42,11 @@ pub trait Backend: Send + Sync {
 
     /// `ssh-add -d`: stop serving the identity whose public key blob is
     /// `key_blob`. Returns whether it was served.
-    ///
-    /// Called while the agent takes key changes one at a time: a request
-    /// that changes keys (through [`Agent::handle`](crate::Agent::handle))
-    /// made from here waits for this one to finish, so never returns.
-    /// [`Agent::release`](crate::Agent::release) and the agent's other
-    /// methods may be called.
     fn remove(&self, _key_blob: &[u8]) -> bool {
         false
     }
 
     /// `ssh-add -D`: stop serving every identity this backend can drop.
-    /// Called while key changes are taken one at a time, as
-    /// [`Self::remove`] is.
     fn remove_all(&self) {}
 
     /// Drop identities whose lifetime has run out. Called before every
