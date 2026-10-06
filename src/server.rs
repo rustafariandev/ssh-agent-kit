@@ -11,11 +11,11 @@ use crate::destination::Connection;
 use crate::wire;
 use nix::sys::stat::{Mode, umask};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -295,15 +295,29 @@ pub fn bind_socket(path: &Path) -> Result<(UnixListener, SocketGuard), SocketErr
             }
         }
     }
-    let previous = umask(Mode::from_bits_truncate(0o077));
-    let bound = UnixListener::bind(path);
-    umask(previous);
-    let listener = bound.map_err(|source| SocketError::Bind {
+    let bind_error = |source| SocketError::Bind {
         path: path.to_owned(),
         source,
-    })?;
-    Ok((listener, SocketGuard(path.to_owned())))
+    };
+    // The umask is process-wide: two binds at once could each restore the
+    // other's, creating a socket others can use and leaving the process with
+    // the wrong umask. Take turns, so the socket is never created open.
+    let listener = {
+        let _turn = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = umask(Mode::from_bits_truncate(0o077));
+        let bound = UnixListener::bind(path);
+        umask(previous);
+        bound.map_err(bind_error)?
+    };
+    let guard = SocketGuard(path.to_owned());
+    // Other code in the process may change the umask without the lock, so
+    // set the mode outright too. On failure the guard removes the socket.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(bind_error)?;
+    Ok((listener, guard))
 }
+
+/// Serialises the umask change in [`bind_socket`].
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Refuse a socket directory another user controls: one owned by someone
 /// other than this user or root, one others can write to without the sticky
@@ -389,6 +403,37 @@ mod tests {
         // A stale socket is replaced.
         drop(UnixListener::bind(&path).unwrap());
         let (_l, _g) = bind_socket(&path).unwrap();
+    }
+
+    /// Sockets bound at the same time from many threads are all owner-only,
+    /// and the process umask is left as it was.
+    #[test]
+    fn parallel_binds_are_all_owner_only() {
+        // Reading the umask means setting it: take the same turn as
+        // `bind_socket`, which other tests may be running meanwhile.
+        let read_umask = || {
+            let _turn = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let current = umask(Mode::from_bits_truncate(0o077));
+            umask(current);
+            current
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let before = read_umask();
+        let threads: Vec<_> = (0..32)
+            .map(|i| {
+                let path = dir.path().join(format!("agent-{i}.sock"));
+                std::thread::spawn(move || {
+                    let bound = bind_socket(&path).unwrap();
+                    let mode = std::fs::metadata(&path).unwrap().mode();
+                    (bound, mode)
+                })
+            })
+            .collect();
+        for thread in threads {
+            let (_bound, mode) = thread.join().unwrap();
+            assert_eq!(mode & 0o077, 0, "socket mode {mode:o} is not owner-only");
+        }
+        assert_eq!(read_umask(), before, "umask changed");
     }
 
     #[test]
