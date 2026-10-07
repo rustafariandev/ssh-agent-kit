@@ -64,7 +64,22 @@ impl KeyDecoder for LocalDecoder {
 /// The key types the agent can decode, in registration order.
 #[derive(Clone)]
 pub struct KeyRegistry {
-    decoders: Vec<Arc<dyn KeyDecoder>>,
+    decoders: Vec<Registered>,
+}
+
+/// A decoder and the key types it answered when registered, read once so
+/// that the registry never calls back into it to match a name.
+#[derive(Clone)]
+pub(crate) struct Registered {
+    key_types: Vec<String>,
+    decoder: Arc<dyn KeyDecoder>,
+}
+
+impl Registered {
+    pub(crate) fn new(decoder: Arc<dyn KeyDecoder>) -> Self {
+        let key_types = decoder.key_types().iter().map(|t| t.to_string()).collect();
+        Registered { key_types, decoder }
+    }
 }
 
 impl KeyRegistry {
@@ -91,15 +106,15 @@ impl KeyRegistry {
     /// can replace a built-in type as well as add a new one. Earlier decoders
     /// left with no name of their own are dropped.
     pub fn register(&mut self, decoder: impl KeyDecoder + 'static) {
-        self.register_shared(Arc::new(decoder));
+        self.register_shared(Registered::new(Arc::new(decoder)));
     }
 
-    /// [`Self::register`] for a decoder already shared, so a registration
-    /// can be applied again to a newer copy of the registry.
-    pub(crate) fn register_shared(&mut self, decoder: Arc<dyn KeyDecoder>) {
-        let names = decoder.key_types();
+    /// [`Self::register`] for a decoder already shared, with its key types
+    /// read, so a registration can be applied again to a newer copy of the
+    /// registry without calling the decoder.
+    pub(crate) fn register_shared(&mut self, decoder: Registered) {
         self.decoders
-            .retain(|d| d.key_types().iter().any(|t| !names.contains(t)));
+            .retain(|d| d.key_types.iter().any(|t| !decoder.key_types.contains(t)));
         self.decoders.push(decoder);
     }
 
@@ -109,8 +124,9 @@ impl KeyRegistry {
         self.decoders
             .iter()
             .rev()
-            .find(|decoder| decoder.key_types().contains(&key_type))
+            .find(|d| d.key_types.iter().any(|t| t == key_type))
             .ok_or_else(|| KeyDecodeError::UnsupportedType(key_type.to_owned()))?
+            .decoder
             .decode(key_type, reader)
     }
 }

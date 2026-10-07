@@ -35,9 +35,11 @@ follows [Semantic Versioning](https://semver.org/).
   served under constraints, replaced the key's constraints, so the key and
   its certificates signed without them. Such certificates now take the
   key's constraints, and the key keeps them.
-- A backend that dropped an `ssh-add -s` key while its certificates were
-  being added left them served, through a key no backend served and
-  without its `-c`/`-h`. They are now refused with it.
+- An `ssh-add -s` key removed while its certificates were being added, by
+  its backend or by another connection's `ssh-add -e`, left them served,
+  through a key no backend served and without its `-c`/`-h`. They are now
+  attached before any other key change can land, and taken back if the
+  backend dropped the key on its own meanwhile.
 - A backend that released an `ssh-add -s -c`/`-h` key while re-serving it
   for the add took its constraints, so the key signed without them once
   added. They are now recorded again when the add succeeds.
@@ -62,18 +64,20 @@ follows [Semantic Versioning](https://semver.org/).
 - Listing and signing no longer wait on key changes: they read an immutable
   snapshot of the added keys, certificates and constraints, which each
   change replaces with a changed copy. Extensions and key types are
-  registered the same way. Each certificate is kept with the key that
-  signs for it, so a key and what was attached to it come and go together.
+  registered the same way, each by the name or key types it gave when
+  registered, which are not asked again. Each certificate is kept with the
+  key that signs for it, so a key and what was attached to it come and go
+  together.
   Expired keys are dropped, and their secrets freed, by the first read or
   change after they expire.
-- Key changes no longer hold their lock while looking keys up, asking the
-  policy or the provider for the key, or calling the `cleared` hook. Those
-  run first, with no lock held; the change then takes its turn and, if
-  other changes landed meanwhile, prepares again. Only a backend's
-  `remove`/`remove_all` and a provider's `add`/`remove` run during the
-  turn, so a PIN prompt in `SmartcardProvider::resolve` no longer holds up
-  other connections' key changes, and `Policy::allow_manage` and
-  `Lifecycle::cleared` may change keys themselves.
+- Key changes no longer hold their lock while looking keys up or asking
+  the policy or the provider for the key. Those run first, with no lock
+  held; the change then takes its turn and, if other changes landed
+  meanwhile, prepares again. Only a backend's `remove`/`remove_all`, a
+  provider's `add`/`remove` and the `cleared` hook run during the turn, so
+  a PIN prompt in `SmartcardProvider::resolve` no longer holds up other
+  connections' key changes, and `Policy::allow_manage` may change keys
+  itself.
 
 ## [0.1.0] - 2026-10-04
 

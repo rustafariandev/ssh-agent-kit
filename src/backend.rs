@@ -106,8 +106,10 @@ pub trait Lifecycle: Send + Sync {
     /// `ssh-add -X` unlocked it.
     fn unlocked(&self) {}
 
-    /// `ssh-add -D` removed every identity. Called once the change is
-    /// committed, with no lock held, so it may change keys itself.
+    /// `ssh-add -D` removed every identity. Called before another key
+    /// change can land, while the agent commits this one: a request that
+    /// changes keys (through [`Agent::handle`](crate::Agent::handle)) made
+    /// from here is refused.
     fn cleared(&self) {}
 }
 
