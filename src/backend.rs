@@ -101,9 +101,15 @@ pub trait SmartcardProvider: Send + Sync {
 /// Hears the agent's state changes.
 pub trait Lifecycle: Send + Sync {
     /// `ssh-add -x` locked the agent.
+    ///
+    /// Called before the agent is locked or unlocked again, so the hooks
+    /// hear of each in the order they happened: a lock or unlock asked for
+    /// from here (through [`Agent::handle`](crate::Agent::handle),
+    /// [`Agent::lock`](crate::Agent::lock) or
+    /// [`Agent::unlock`](crate::Agent::unlock)) fails.
     fn locked(&self) {}
 
-    /// `ssh-add -X` unlocked it.
+    /// `ssh-add -X` unlocked it. Called as [`Self::locked`] is.
     fn unlocked(&self) {}
 
     /// `ssh-add -D` removed every identity. Called before another key

@@ -10,9 +10,11 @@
 //! 1. User code is never called while a lock is held, except the calls that
 //!    must be ordered: a backend's `remove`/`remove_all`, a provider's
 //!    `add`/`remove` and [`Lifecycle::cleared`] during a key change's turn
-//!    (`changes`, see `Agent::prepared_turn`), and [`Locker::unlock`] during
-//!    an unlock attempt (`unlock_failures`). Everything else a change needs,
-//!    from key lookups to the policy, runs first, against a snapshot.
+//!    (`changes`, see `Agent::prepared_turn`), and the [`Locker`] and the
+//!    `locked`/`unlocked` hooks while the agent is locked or unlocked
+//!    (`lock_state`), so the hooks hear of each in order. Everything else a
+//!    change needs, from key lookups to the policy, runs first, against a
+//!    snapshot. No lock is held through an unlock guess's delay.
 //! 2. The closures given to `Agent::write` and the other `rcu` calls only
 //!    change the value they are given: no I/O, no logging, no user code, no
 //!    nested write. They may run more than once.
@@ -43,7 +45,7 @@ use ssh_encoding::Decode;
 use ssh_key::{HashAlg, PublicKey};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -132,11 +134,11 @@ pub struct Agent {
     /// Lifetime applied to keys added without their own `ssh-add -t`, as
     /// `ssh-agent -t` does; `None` keeps them until removed.
     default_lifetime: Option<u32>,
-    /// Wrong unlock passphrases since the last good one, which slow down
-    /// each further failure (see [`Self::handle_unlock`]). Held through each
-    /// unlock attempt and its delay, so guesses are taken one at a time
-    /// however many connections send them.
-    unlock_failures: Mutex<u32>,
+    /// Held through each lock or unlock and its hooks, so the hooks hear of
+    /// them in the order they happened, and through each unlock guess, so
+    /// guesses are taken one at a time however many connections send them.
+    /// Never held through a guess's delay (see [`Self::handle_unlock`]).
+    lock_state: Mutex<LockState>,
     /// Delay added per recorded failure.
     unlock_backoff: Duration,
 }
@@ -624,8 +626,16 @@ impl Store {
 enum Turn {
     /// `changes`, while a key change commits.
     Change,
-    /// `unlock_failures`, while an unlock attempt is checked.
-    Unlock,
+    /// `lock_state`, while the agent is locked or unlocked.
+    Lock,
+}
+
+/// Wrong unlock passphrases since the last good one, and when the next
+/// guess may be checked: each failure delays the next by 0.1 s more.
+#[derive(Debug, Default)]
+struct LockState {
+    failures: u32,
+    next_guess: Option<Instant>,
 }
 
 thread_local! {
@@ -698,7 +708,7 @@ impl Agent {
             lifecycle: Vec::new(),
             locker: Arc::new(PassphraseLock::default()),
             default_lifetime: None,
-            unlock_failures: Mutex::new(0),
+            lock_state: Mutex::default(),
             unlock_backoff: UNLOCK_BACKOFF,
         }
     }
@@ -908,8 +918,14 @@ impl Agent {
         self.locker.is_locked()
     }
 
-    /// Lock with `passphrase`; fails if already locked, as in OpenSSH.
+    /// Lock with `passphrase`; fails if already locked, as in OpenSSH. The
+    /// [`Lifecycle::locked`] hooks run before any other lock or unlock, and
+    /// one asked for from a hook, on the same thread, fails.
     pub fn lock(&self, passphrase: &[u8]) -> bool {
+        let Some(_holding) = Holding::enter(self, Turn::Lock) else {
+            return false;
+        };
+        let _state = lock(&self.lock_state);
         let locked = self.locker.lock(passphrase);
         if locked {
             self.lifecycle.iter().for_each(|hook| hook.locked());
@@ -917,8 +933,14 @@ impl Agent {
         locked
     }
 
-    /// Unlock if `passphrase` is the one the agent was locked with.
+    /// Unlock if `passphrase` is the one the agent was locked with, as
+    /// [`Self::lock`] locks. Unlike `ssh-add -X`, a wrong passphrase is
+    /// neither counted nor delayed: this is the owner's own call.
     pub fn unlock(&self, passphrase: &[u8]) -> bool {
+        let Some(_holding) = Holding::enter(self, Turn::Lock) else {
+            return false;
+        };
+        let _state = lock(&self.lock_state);
         let unlocked = self.locker.unlock(passphrase);
         if unlocked {
             self.lifecycle.iter().for_each(|hook| hook.unlocked());
@@ -1619,40 +1641,50 @@ impl Agent {
     ///
     /// A wrong passphrase is answered only after a delay that grows by 0.1 s
     /// with each failure, up to 10 s, as OpenSSH does, so the passphrase
-    /// cannot be guessed quickly through the socket.
+    /// cannot be guessed quickly through the socket. Guesses are checked one
+    /// at a time, each no sooner than the last one's delay ends, however
+    /// many connections send them; no lock is held through a delay.
     fn handle_unlock(&self, passphrase: &[u8]) -> Vec<u8> {
-        if !self.is_locked() {
-            tracing::warn!("unlock request refused: agent is not locked");
-            return wire::failure();
-        }
-        // Held through the check and the delay, so guesses are taken one at
-        // a time however many connections send them; the hooks run after.
-        let unlocked = {
-            let Some(_holding) = Holding::enter(self, Turn::Unlock) else {
+        loop {
+            let Some(holding) = Holding::enter(self, Turn::Lock) else {
                 return wire::failure();
             };
-            let mut failures = lock(&self.unlock_failures);
-            if self.locker.unlock(passphrase) {
-                *failures = 0;
-                true
-            } else {
-                *failures = (*failures + 1).min(MAX_UNLOCK_FAILURES);
-                let delay = self.unlock_backoff * *failures;
-                tracing::warn!(
-                    failures = *failures,
-                    ?delay,
-                    "unlock request refused: wrong passphrase"
-                );
-                std::thread::sleep(delay);
-                false
+            let mut state = lock(&self.lock_state);
+            let now = Instant::now();
+            if let Some(wait) = state
+                .next_guess
+                .and_then(|at| at.checked_duration_since(now))
+            {
+                drop(state);
+                drop(holding);
+                std::thread::sleep(wait);
+                continue;
             }
-        };
-        if !unlocked {
+            // Checked here, in turn, so a second right passphrase that waited
+            // behind the first is not counted as a wrong one.
+            if !self.locker.is_locked() {
+                tracing::warn!("unlock request refused: agent is not locked");
+                return wire::failure();
+            }
+            if self.locker.unlock(passphrase) {
+                *state = LockState::default();
+                self.lifecycle.iter().for_each(|hook| hook.unlocked());
+                tracing::info!("agent unlocked");
+                return wire::success();
+            }
+            state.failures = (state.failures + 1).min(MAX_UNLOCK_FAILURES);
+            let delay = self.unlock_backoff * state.failures;
+            state.next_guess = Some(now + delay);
+            tracing::warn!(
+                failures = state.failures,
+                ?delay,
+                "unlock request refused: wrong passphrase"
+            );
+            drop(state);
+            drop(holding);
+            std::thread::sleep(delay);
             return wire::failure();
         }
-        self.lifecycle.iter().for_each(|hook| hook.unlocked());
-        tracing::info!("agent unlocked");
-        wire::success()
     }
 
     /// Answer an `SSH_AGENTC_EXTENSION` request. The built-in
@@ -1985,11 +2017,14 @@ mod tests {
     fn the_unlock_failure_count_saturates() {
         let agent = Agent::new().with_unlock_backoff(Duration::ZERO);
         assert!(agent.lock(b"hunter2"));
-        *agent.unlock_failures.lock().unwrap() = MAX_UNLOCK_FAILURES;
+        agent.lock_state.lock().unwrap().failures = MAX_UNLOCK_FAILURES;
         let mut wrong = vec![wire::SSH_AGENTC_UNLOCK];
         b"hunter3".as_slice().encode(&mut wrong).unwrap();
         assert_eq!(agent.handle(&wrong), wire::failure());
-        assert_eq!(*agent.unlock_failures.lock().unwrap(), MAX_UNLOCK_FAILURES);
+        assert_eq!(
+            agent.lock_state.lock().unwrap().failures,
+            MAX_UNLOCK_FAILURES
+        );
     }
 
     /// Each wrong unlock passphrase waits longer than the last; the right one
@@ -2005,13 +2040,13 @@ mod tests {
             let started = Instant::now();
             assert_eq!(agent.handle(&wrong), wire::failure());
             assert!(started.elapsed() >= Duration::from_millis(20) * failures);
-            assert_eq!(*agent.unlock_failures.lock().unwrap(), failures);
+            assert_eq!(agent.lock_state.lock().unwrap().failures, failures);
         }
 
         let mut right = vec![wire::SSH_AGENTC_UNLOCK];
         b"hunter2".as_slice().encode(&mut right).unwrap();
         assert_eq!(agent.handle(&right), wire::success());
-        assert_eq!(*agent.unlock_failures.lock().unwrap(), 0);
+        assert_eq!(agent.lock_state.lock().unwrap().failures, 0);
     }
 
     /// Guesses sent on parallel connections wait their turn, so more
@@ -3831,32 +3866,24 @@ mod tests {
         assert!(agent.public_keys().is_empty());
     }
 
-    /// The `unlocked` hook runs once the unlock attempt is over, so it may
-    /// send an unlock itself without waiting on the attempt that called it.
+    /// A lock or unlock asked for from an `unlocked` hook, on the same
+    /// thread, is refused rather than waiting on the unlock that called it.
     #[test]
-    fn the_unlocked_hook_may_unlock_again() {
+    fn the_unlocked_hook_cannot_lock_again() {
         struct Relocks {
             agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
-            relocked: std::sync::atomic::AtomicBool,
-            reply: Mutex<Option<Vec<u8>>>,
+            relocked: Mutex<Option<bool>>,
         }
         impl Lifecycle for Relocks {
             fn unlocked(&self) {
-                if self.relocked.swap(true, Ordering::SeqCst) {
-                    return;
-                }
                 let agent = self.agent.get().unwrap().upgrade().unwrap();
-                assert!(agent.lock(b"again"));
-                let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
-                b"again".as_slice().encode(&mut unlock).unwrap();
-                *self.reply.lock().unwrap() = Some(agent.handle(&unlock));
+                *self.relocked.lock().unwrap() = Some(agent.lock(b"again"));
             }
         }
 
         let hook = Arc::new(Relocks {
             agent: std::sync::OnceLock::new(),
-            relocked: Default::default(),
-            reply: Mutex::default(),
+            relocked: Mutex::default(),
         });
         let agent = Arc::new(Agent::new().with_lifecycle(Arc::clone(&hook) as _));
         let _ = hook.agent.set(Arc::downgrade(&agent));
@@ -3872,10 +3899,122 @@ mod tests {
         }
         let outer = finished
             .recv_timeout(Duration::from_secs(5))
-            .expect("the unlocked hook's unlock deadlocked");
+            .expect("the unlocked hook's lock deadlocked");
         assert_eq!(outer, wire::success());
-        assert_eq!(*hook.reply.lock().unwrap(), Some(wire::success()));
+        assert_eq!(*hook.relocked.lock().unwrap(), Some(false));
         assert!(!agent.is_locked());
+    }
+
+    /// A lock sent while an unlock's hooks run waits for them, so hooks
+    /// hear of the unlock before the lock that followed it.
+    #[test]
+    fn lock_hooks_run_in_order() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        struct Ordered {
+            events: Mutex<Vec<&'static str>>,
+            started: Mutex<Sender<()>>,
+            go: Mutex<Receiver<()>>,
+        }
+        impl Lifecycle for Ordered {
+            fn locked(&self) {
+                self.events.lock().unwrap().push("locked");
+            }
+            fn unlocked(&self) {
+                self.events.lock().unwrap().push("unlocked");
+                let _ = self.started.lock().unwrap().send(());
+                let _ = self.go.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                self.events.lock().unwrap().push("unlocked done");
+            }
+        }
+
+        let (started, start) = channel();
+        let (go, gone) = channel();
+        let hook = Arc::new(Ordered {
+            events: Mutex::default(),
+            started: Mutex::new(started),
+            go: Mutex::new(gone),
+        });
+        let agent = Arc::new(Agent::new().with_lifecycle(Arc::clone(&hook) as _));
+        assert!(agent.lock(b"hunter2"));
+        hook.events.lock().unwrap().clear();
+        let unlocking = {
+            let agent = Arc::clone(&agent);
+            let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+            b"hunter2".as_slice().encode(&mut unlock).unwrap();
+            std::thread::spawn(move || agent.handle(&unlock))
+        };
+        start.recv_timeout(Duration::from_secs(5)).unwrap();
+        let locking = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || agent.lock(b"again"))
+        };
+        // Let the lock reach its wait before the hook goes on.
+        std::thread::sleep(Duration::from_millis(100));
+        go.send(()).unwrap();
+        assert_eq!(unlocking.join().unwrap(), wire::success());
+        assert!(locking.join().unwrap());
+        assert_eq!(
+            *hook.events.lock().unwrap(),
+            ["unlocked", "unlocked done", "locked"]
+        );
+    }
+
+    /// Two right passphrases sent at once unlock once: the second finds the
+    /// agent unlocked and is refused as such, not counted as a wrong guess.
+    #[test]
+    fn a_second_right_unlock_is_not_a_wrong_guess() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        struct Slow {
+            inner: PassphraseLock,
+            checking: Mutex<Sender<()>>,
+            go: Mutex<Receiver<()>>,
+        }
+        impl Locker for Slow {
+            fn is_locked(&self) -> bool {
+                self.inner.is_locked()
+            }
+            fn lock(&self, passphrase: &[u8]) -> bool {
+                self.inner.lock(passphrase)
+            }
+            fn unlock(&self, passphrase: &[u8]) -> bool {
+                let _ = self.checking.lock().unwrap().send(());
+                let _ = self.go.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                self.inner.unlock(passphrase)
+            }
+        }
+
+        let (checking, check) = channel();
+        let (go, gone) = channel();
+        let agent = Arc::new(
+            Agent::new()
+                .with_locker(Arc::new(Slow {
+                    inner: PassphraseLock::default(),
+                    checking: Mutex::new(checking),
+                    go: Mutex::new(gone),
+                }))
+                .with_unlock_backoff(Duration::from_secs(1)),
+        );
+        assert!(agent.lock(b"hunter2"));
+        let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut unlock).unwrap();
+        let send = |unlock: Vec<u8>| {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || agent.handle(&unlock))
+        };
+        let first = send(unlock.clone());
+        check.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        let second = send(unlock);
+        // Let the second reach its wait before the first is checked.
+        std::thread::sleep(Duration::from_millis(100));
+        go.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), wire::success());
+        assert_eq!(second.join().unwrap(), wire::failure());
+        assert_eq!(agent.lock_state.lock().unwrap().failures, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the second was delayed"
+        );
     }
 
     /// An `ssh-add -X` sent from inside the `Locker`'s own check, on the
