@@ -836,6 +836,44 @@ fn a_provider_adding_may_lock() {
     ]);
 }
 
+/// Two agents in one process, each `cleared` hook clearing the other:
+/// one thread holds A's turn and waits for B's while another holds B's and
+/// waits for A's. A callback is refused a turn of the agent it was called
+/// from, but not of another agent, so the two wait on each other.
+#[test]
+#[ignore = "deadlocks: a callback may take another agent's turn"]
+fn two_agents_clearing_each_other_do_not_deadlock() {
+    let clearing = |other: &Arc<Back>| {
+        let other = Arc::clone(other);
+        Arc::new(Hooks {
+            on_cleared: Some(Box::new(move |_: &Agent| {
+                if let Some(other) = other.agent() {
+                    other.handle(&remove_all());
+                }
+            })),
+            ..Hooks::default()
+        })
+    };
+    let (to_a, to_b) = (Arc::new(Back::default()), Arc::new(Back::default()));
+    let (hooks_a, hooks_b) = (clearing(&to_b), clearing(&to_a));
+    let a = Arc::new(Agent::new().with_lifecycle(Arc::clone(&hooks_a) as _));
+    let b = Arc::new(Agent::new().with_lifecycle(Arc::clone(&hooks_b) as _));
+    hooks_a.back.set(&a);
+    hooks_b.back.set(&b);
+    to_a.set(&a);
+    to_b.set(&b);
+    stress(vec![
+        worker("clear a", move |step| {
+            step.doing("remove all");
+            a.handle(&remove_all());
+        }),
+        worker("clear b", move |step| {
+            step.doing("remove all");
+            b.handle(&remove_all());
+        }),
+    ]);
+}
+
 /// One thread clears the agent while another locks and unlocks it.
 fn cross_turns(agent: Arc<Agent>) {
     let changer = Arc::clone(&agent);
