@@ -175,28 +175,21 @@ const REMEMBERED_CHANGES: usize = 64;
 struct CertIdentity<'a> {
     cert: &'a CertKey,
     comment: &'a str,
-    signer: CertSigner<'a>,
-}
-
-enum CertSigner<'a> {
-    /// The private key `ssh-add FILE` sent with the certificate, and the
-    /// `ssh-add -c`/`-h` constraints the certificate was added with.
-    Held {
-        key: &'a SignerRef,
-        meta: &'a KeyMeta,
-    },
-    /// The key `ssh-add -s PROVIDER CERT…` named; dropped with it, and
-    /// constrained as it is.
-    Provider(&'a SignerRef),
+    /// The private key `ssh-add FILE` sent with the certificate, or the key
+    /// `ssh-add -s PROVIDER CERT…` named, which it is dropped with.
+    key: &'a SignerRef,
+    /// The `ssh-add -c`/`-h` constraints `ssh-add FILE` added it with;
+    /// `None` for `ssh-add -s`, whose certificates are constrained as their
+    /// key is.
+    own: Option<&'a KeyMeta>,
 }
 
 impl CertIdentity<'_> {
-    /// The key that signs for the certificate, and where the certificate's
-    /// constraints are kept.
-    fn signs_with(&self) -> (SignerRef, Constraints) {
-        match self.signer {
-            CertSigner::Held { key, meta } => (key.clone(), Constraints::Own(meta.clone())),
-            CertSigner::Provider(key) => (key.clone(), Constraints::Provider(key.key_blob())),
+    /// Where the certificate's constraints are kept.
+    fn constraints(&self) -> Constraints {
+        match self.own {
+            Some(meta) => Constraints::Own(meta.clone()),
+            None => Constraints::Provider(self.key.key_blob()),
         }
     }
 }
@@ -326,23 +319,41 @@ impl Store {
     }
 
     /// Drop expired keys and certificates, constraints and all.
-    /// Only a collection holding something expired is replaced, so readers
-    /// comparing snapshots see the other unchanged.
     fn purge_expired(&mut self) {
-        if self.held.iter().any(HeldEntry::has_expired) {
-            let held = Arc::make_mut(&mut self.held);
-            held.iter_mut().for_each(HeldEntry::purge_expired);
-            held.retain(|e| !e.is_empty());
-        }
-        if self.provider.iter().any(ProviderEntry::has_expired) {
-            let provider = Arc::make_mut(&mut self.provider);
-            provider.iter_mut().for_each(ProviderEntry::purge_expired);
-            provider.retain(|e| !e.is_empty());
-        }
+        edit(
+            &mut self.held,
+            HeldEntry::has_expired,
+            HeldEntry::purge_expired,
+            HeldEntry::is_empty,
+        );
+        edit(
+            &mut self.provider,
+            ProviderEntry::has_expired,
+            ProviderEntry::purge_expired,
+            ProviderEntry::is_empty,
+        );
     }
 
     fn held_entry(&self, key_blob: &[u8]) -> Option<&HeldEntry> {
         self.held.iter().find(|e| e.key.key_blob() == key_blob)
+    }
+
+    /// The entry of the added key `key`, made if there is none.
+    fn held_entry_mut(&mut self, key: &SignerRef) -> &mut HeldEntry {
+        let blob = key.key_blob();
+        let held = Arc::make_mut(&mut self.held);
+        let at = match held.iter().position(|e| e.key.key_blob() == blob) {
+            Some(at) => at,
+            None => {
+                held.push(HeldEntry {
+                    key: key.clone(),
+                    own: None,
+                    certs: Vec::new(),
+                });
+                held.len() - 1
+            }
+        };
+        &mut held[at]
     }
 
     /// The added key `key_blob` names and its constraints, unless it is not
@@ -381,10 +392,8 @@ impl Store {
                 .map(|e| CertIdentity {
                     cert: &e.item.cert,
                     comment: &e.item.comment,
-                    signer: CertSigner::Held {
-                        key: &entry.key,
-                        meta: &e.item.meta,
-                    },
+                    key: &entry.key,
+                    own: Some(&e.item.meta),
                 })
         });
         let provider = self.provider.iter().flat_map(|entry| {
@@ -395,7 +404,8 @@ impl Store {
                 .map(|e| CertIdentity {
                     cert: &e.item.cert,
                     comment: e.item.key.comment(),
-                    signer: CertSigner::Provider(&e.item.key),
+                    key: &e.item.key,
+                    own: None,
                 })
         });
         held.chain(provider)
@@ -407,96 +417,89 @@ impl Store {
         self.certs().find(|c| c.cert.blob() == blob)
     }
 
-    /// Serve `key` as an identity of its own under `meta`, replacing its
-    /// constraints and lifetime if it is already served. Its certificates
-    /// keep theirs.
-    fn hold(&mut self, key: SignerRef, meta: KeyMeta, lifetime: Option<u32>) {
-        let own = Some(Expiring::new(meta, lifetime));
-        let blob = key.key_blob();
-        let held = Arc::make_mut(&mut self.held);
-        match held.iter_mut().find(|e| e.key.key_blob() == blob) {
-            Some(entry) => {
-                entry.key = key;
-                entry.own = own;
-            }
-            None => held.push(HeldEntry {
-                key,
-                own,
-                certs: Vec::new(),
-            }),
-        }
+    /// Serve `key` as an identity of its own under `meta`, or without one
+    /// under the constraints it is served under already, replacing its
+    /// lifetime. Its certificates keep theirs.
+    fn hold(&mut self, key: SignerRef, meta: Option<KeyMeta>, lifetime: Option<u32>) {
+        let meta = meta
+            .or_else(|| self.held_key(&key.key_blob()).map(|(_, m)| m.clone()))
+            .unwrap_or_default();
+        let entry = self.held_entry_mut(&key);
+        entry.key = key;
+        entry.own = Some(Expiring::new(meta, lifetime));
     }
 
-    /// Serve `cert`, signed for by `key`, under `meta`, replacing the same
+    /// Serve `cert`, signed for by `key`, under `meta`, or without one under
+    /// the constraints it is served under already, replacing the same
     /// certificate wherever it is served.
-    fn hold_cert(&mut self, key: SignerRef, cert: CertKey, meta: KeyMeta, lifetime: Option<u32>) {
+    fn hold_cert(
+        &mut self,
+        key: SignerRef,
+        cert: CertKey,
+        meta: Option<KeyMeta>,
+        lifetime: Option<u32>,
+    ) {
+        let meta = meta
+            .or_else(|| self.held_cert_meta(cert.blob()).cloned())
+            .unwrap_or_default();
         self.take_cert(cert.blob());
-        let comment = key.comment().to_owned();
         let added = Expiring::new(
             HeldCert {
                 cert,
-                comment,
+                comment: key.comment().to_owned(),
                 meta,
             },
             lifetime,
         );
-        let blob = key.key_blob();
-        let held = Arc::make_mut(&mut self.held);
-        match held.iter_mut().find(|e| e.key.key_blob() == blob) {
-            Some(entry) => entry.certs.push(added),
-            None => held.push(HeldEntry {
-                key,
-                own: None,
-                certs: vec![added],
-            }),
-        }
+        self.held_entry_mut(&key).certs.push(added);
     }
 
     /// Stop serving the added key `key_blob` as an identity of its own. Its
     /// certificates stay. Returns whether it was served.
     fn remove_held(&mut self, key_blob: &[u8]) -> bool {
-        if self.held_entry(key_blob).is_none_or(|e| e.own.is_none()) {
-            return false;
-        }
-        let held = Arc::make_mut(&mut self.held);
-        held.iter_mut()
-            .filter(|e| e.key.key_blob() == key_blob)
-            .for_each(|e| e.own = None);
-        held.retain(|e| !e.is_empty());
-        true
+        edit(
+            &mut self.held,
+            |e| e.own.is_some() && e.key.key_blob() == key_blob,
+            |e| e.own = None,
+            HeldEntry::is_empty,
+        )
     }
 
     /// Stop serving the certificate whose blob is `blob`, wherever it is
     /// kept. Returns whether it was served.
     fn take_cert(&mut self, blob: &[u8]) -> bool {
-        if self
-            .held
-            .iter()
-            .any(|e| e.certs.iter().any(|c| c.item.cert.blob() == blob))
-        {
-            let held = Arc::make_mut(&mut self.held);
-            held.iter_mut()
-                .for_each(|e| e.certs.retain(|c| c.item.cert.blob() != blob));
-            held.retain(|e| !e.is_empty());
-            return true;
-        }
-        if self
-            .provider
-            .iter()
-            .any(|e| e.certs.iter().any(|c| c.item.cert.blob() == blob))
-        {
-            let provider = Arc::make_mut(&mut self.provider);
-            provider
-                .iter_mut()
-                .for_each(|e| e.certs.retain(|c| c.item.cert.blob() != blob));
-            provider.retain(|e| !e.is_empty());
-            return true;
-        }
-        false
+        edit(
+            &mut self.held,
+            |e| e.certs.iter().any(|c| c.item.cert.blob() == blob),
+            |e| e.certs.retain(|c| c.item.cert.blob() != blob),
+            HeldEntry::is_empty,
+        ) || edit(
+            &mut self.provider,
+            |e| e.certs.iter().any(|c| c.item.cert.blob() == blob),
+            |e| e.certs.retain(|c| c.item.cert.blob() != blob),
+            ProviderEntry::is_empty,
+        )
     }
 
     fn provider_entry(&self, key_blob: &[u8]) -> Option<&ProviderEntry> {
         self.provider.iter().find(|e| e.key_blob == key_blob)
+    }
+
+    /// What `ssh-add -s` attached to the key `key_blob`, made if nothing is.
+    fn provider_entry_mut(&mut self, key_blob: Vec<u8>) -> &mut ProviderEntry {
+        let provider = Arc::make_mut(&mut self.provider);
+        let at = match provider.iter().position(|e| e.key_blob == key_blob) {
+            Some(at) => at,
+            None => {
+                provider.push(ProviderEntry {
+                    key_blob,
+                    meta: KeyMeta::default(),
+                    certs: Vec::new(),
+                });
+                provider.len() - 1
+            }
+        };
+        &mut provider[at]
     }
 
     /// The certificates `ssh-add -s` attached to the key `key_blob`, by blob.
@@ -516,22 +519,15 @@ impl Store {
     /// Record or clear the constraints of a key `ssh-add -s` added, which
     /// its certificates share.
     fn set_provider_meta(&mut self, key_blob: Vec<u8>, meta: KeyMeta) {
-        match self.provider_entry(&key_blob) {
-            Some(entry) if entry.meta == meta => {}
-            Some(_) => {
-                let provider = Arc::make_mut(&mut self.provider);
-                provider
-                    .iter_mut()
-                    .filter(|e| e.key_blob == key_blob)
-                    .for_each(|e| e.meta = meta.clone());
-                provider.retain(|e| !e.is_empty());
-            }
-            None if meta.is_empty() => {}
-            None => Arc::make_mut(&mut self.provider).push(ProviderEntry {
-                key_blob,
-                meta,
-                certs: Vec::new(),
-            }),
+        if self.provider_entry(&key_blob).is_some() {
+            edit(
+                &mut self.provider,
+                |e| e.key_blob == key_blob && e.meta != meta,
+                |e| e.meta = meta.clone(),
+                ProviderEntry::is_empty,
+            );
+        } else if !meta.is_empty() {
+            self.provider_entry_mut(key_blob).meta = meta;
         }
     }
 
@@ -550,16 +546,9 @@ impl Store {
                 lifetime,
             )
         });
-        let blob = key.key_blob();
-        let provider = Arc::make_mut(&mut self.provider);
-        match provider.iter_mut().find(|e| e.key_blob == blob) {
-            Some(entry) => entry.certs.extend(attached),
-            None => provider.push(ProviderEntry {
-                key_blob: blob,
-                meta: KeyMeta::default(),
-                certs: attached.collect(),
-            }),
-        }
+        self.provider_entry_mut(key.key_blob())
+            .certs
+            .extend(attached);
     }
 
     /// Stop serving `certs`, if `ssh-add -s` attached them to the key
@@ -567,18 +556,12 @@ impl Store {
     fn detach_provider_certs(&mut self, key_blob: &[u8], certs: &[CertKey]) {
         let ours =
             |c: &Expiring<ProviderCert>| certs.iter().any(|cert| cert.blob() == c.item.cert.blob());
-        if !self
-            .provider_entry(key_blob)
-            .is_some_and(|e| e.certs.iter().any(ours))
-        {
-            return;
-        }
-        let provider = Arc::make_mut(&mut self.provider);
-        provider
-            .iter_mut()
-            .filter(|e| e.key_blob == key_blob)
-            .for_each(|e| e.certs.retain(|c| !ours(c)));
-        provider.retain(|e| !e.is_empty());
+        edit(
+            &mut self.provider,
+            |e| e.key_blob == key_blob && e.certs.iter().any(ours),
+            |e| e.certs.retain(|c| !ours(c)),
+            ProviderEntry::is_empty,
+        );
     }
 
     /// Forget what `ssh-add -s` attached to the key `key_blob`, which its
@@ -721,9 +704,14 @@ struct Holding {
 }
 
 impl Holding {
+    /// The address `HELD` knows `agent` by.
+    fn id(agent: &Agent) -> usize {
+        std::ptr::from_ref(agent) as usize
+    }
+
     /// Whether this thread holds `turn` of `agent`.
     fn holds(agent: &Agent, turn: Turn) -> bool {
-        let agent = std::ptr::from_ref(agent) as usize;
+        let agent = Self::id(agent);
         HELD.with(|held| held.borrow().contains(&(agent, turn)))
     }
 
@@ -731,7 +719,7 @@ impl Holding {
     /// already: the same one would wait on itself, and the other on any
     /// thread holding it while it waits for the one this thread holds.
     fn enter(agent: &Agent, turn: Turn) -> Option<Holding> {
-        let agent = std::ptr::from_ref(agent) as usize;
+        let agent = Self::id(agent);
         let holding = HELD.with(|held| {
             held.borrow()
                 .iter()
@@ -767,6 +755,13 @@ impl Drop for Holding {
 /// This thread's turn to commit a key change to one agent.
 struct ChangeTurn<'a> {
     _changes: MutexGuard<'a, ()>,
+    _holding: Holding,
+}
+
+/// This thread's turn to lock or unlock one agent. The guard goes before
+/// the record that this thread holds it.
+struct LockTurn<'a> {
+    state: MutexGuard<'a, LockState>,
     _holding: Holding,
 }
 
@@ -899,25 +894,12 @@ impl Agent {
                     "serving added certificate"
                 );
                 self.write(|store| {
-                    let meta = meta
-                        .clone()
-                        .or_else(|| store.held_cert_meta(cert.blob()).cloned());
-                    store.hold_cert(
-                        key.clone(),
-                        cert.clone(),
-                        meta.unwrap_or_default(),
-                        lifetime,
-                    )
+                    store.hold_cert(key.clone(), cert.clone(), meta.clone(), lifetime)
                 });
             }
             None => {
                 tracing::info!(comment = key.comment(), "serving added key");
-                self.write(|store| {
-                    let meta = meta
-                        .clone()
-                        .or_else(|| store.held_key(&key.key_blob()).map(|(_, m)| m.clone()));
-                    store.hold(key.clone(), meta.unwrap_or_default(), lifetime)
-                });
+                self.write(|store| store.hold(key.clone(), meta.clone(), lifetime));
             }
         }
     }
@@ -982,30 +964,42 @@ impl Agent {
     /// one asked for from a hook or from a key change's callback, on the same
     /// thread, fails.
     pub fn lock(&self, passphrase: &[u8]) -> bool {
-        let Some(_holding) = Holding::enter(self, Turn::Lock) else {
-            return false;
-        };
-        let _state = lock(&self.lock_state);
-        let locked = self.locker.lock(passphrase);
-        if locked {
-            self.lifecycle.iter().for_each(|hook| hook.locked());
-        }
-        locked
+        self.lock_change(|locker| locker.lock(passphrase), |hook| hook.locked())
     }
 
     /// Unlock if `passphrase` is the one the agent was locked with, as
     /// [`Self::lock`] locks. Unlike `ssh-add -X`, a wrong passphrase is
     /// neither counted nor delayed: this is the owner's own call.
     pub fn unlock(&self, passphrase: &[u8]) -> bool {
-        let Some(_holding) = Holding::enter(self, Turn::Lock) else {
+        self.lock_change(|locker| locker.unlock(passphrase), |hook| hook.unlocked())
+    }
+
+    /// Lock or unlock with `change` in the lock turn, and if it did, tell
+    /// the hooks with `hook` before the turn is given up.
+    fn lock_change(
+        &self,
+        change: impl FnOnce(&dyn Locker) -> bool,
+        hook: impl Fn(&dyn Lifecycle),
+    ) -> bool {
+        let Some(_turn) = self.lock_turn() else {
             return false;
         };
-        let _state = lock(&self.lock_state);
-        let unlocked = self.locker.unlock(passphrase);
-        if unlocked {
-            self.lifecycle.iter().for_each(|hook| hook.unlocked());
+        let changed = change(&*self.locker);
+        if changed {
+            self.lifecycle.iter().for_each(|h| hook(&**h));
         }
-        unlocked
+        changed
+    }
+
+    /// Take the turn to lock or unlock, waiting for any other. Refused, with
+    /// an error logged, when this thread holds one of the agent's turns
+    /// already (see [`Holding`]).
+    fn lock_turn(&self) -> Option<LockTurn<'_>> {
+        let holding = Holding::enter(self, Turn::Lock)?;
+        Some(LockTurn {
+            state: lock(&self.lock_state),
+            _holding: holding,
+        })
     }
 
     /// Drop identities whose lifetime has elapsed, in the backends too.
@@ -1212,7 +1206,7 @@ impl Agent {
                 );
                 continue;
             }
-            let (signer, constraints) = identity.signs_with();
+            let constraints = identity.constraints();
             if let Constraints::Provider(blob) = &constraints {
                 if !served.contains(blob) {
                     tracing::debug!(
@@ -1226,7 +1220,7 @@ impl Agent {
             if permitted(&store.resolve(constraints), connection) {
                 out.push(Listing {
                     listed: (identity.cert.blob().to_vec(), identity.comment.to_owned()),
-                    key: signer,
+                    key: identity.key.clone(),
                     cert: Some(identity.cert.clone()),
                 });
             }
@@ -1388,99 +1382,14 @@ impl Agent {
                 confirm,
                 destination,
             } => {
-                let lifetime = self.lifetime_for(lifetime);
-                // The identity this add replaces: a certificate is
-                // constrained apart from its key.
-                let blob = match &cert {
-                    Some(cert) => cert.blob().to_vec(),
-                    None => key.key_blob(),
-                };
-                let prepared = self.prepared_turn(|store| {
-                    let change = KeyChange::Add {
-                        key: key.public_key(),
-                        certificate: cert.as_deref(),
-                        constraints: KeyConstraints {
-                            lifetime,
-                            confirm,
-                            destination: &destination,
-                        },
-                    };
-                    if !self.manage_allowed(change, connection) {
-                        return Err(());
-                    }
-                    if !self.may_manage(store, &blob, connection) {
-                        tracing::warn!("refused: key not permitted on this connection");
-                        return Err(());
-                    }
-                    Ok(())
-                });
-                let Ok(((), _turn)) = prepared else {
-                    return wire::failure();
-                };
                 let meta = KeyMeta {
                     confirm,
                     destination,
                 };
-                self.add_held(key, cert.map(|cert| *cert), lifetime, Some(meta));
-                wire::success()
+                self.add_identity(key, cert.map(|cert| *cert), lifetime, meta, connection)
             }
-            Request::RemoveIdentity { key_blob } => {
-                let prepared = self.prepared_turn(|store| {
-                    let target = self.lookup(store, &key_blob).ok().map(|(key, _)| key);
-                    let change = KeyChange::Remove {
-                        key_blob: &key_blob,
-                        key: target.as_ref().map(|t| t.public_key()),
-                    };
-                    if !self.manage_allowed(change, connection) {
-                        return Err(());
-                    }
-                    if !self.may_manage(store, &key_blob, connection) {
-                        tracing::warn!("refused: key not permitted on this connection");
-                        return Err(());
-                    }
-                    Ok(self.backend_key(&key_blob).is_some())
-                });
-                let Ok((from_backend, _turn)) = prepared else {
-                    return wire::failure();
-                };
-                let removed = self.write(|store| {
-                    if store.remove_held(&key_blob) {
-                        Some("removed added key")
-                    } else if store.take_cert(&key_blob) {
-                        Some("removed certificate")
-                    } else {
-                        None
-                    }
-                });
-                if let Some(removed) = removed {
-                    tracing::info!("{removed}");
-                    wire::success()
-                } else if from_backend && self.backends.iter().any(|b| b.remove(&key_blob)) {
-                    self.release(&key_blob, true);
-                    tracing::info!("removed key");
-                    wire::success()
-                } else {
-                    tracing::debug!("no such key to remove");
-                    wire::failure()
-                }
-            }
-            Request::RemoveAllIdentities => {
-                let prepared = self.prepared_turn(|_| {
-                    match self.manage_allowed(KeyChange::RemoveAll, connection) {
-                        true => Ok(()),
-                        false => Err(()),
-                    }
-                });
-                let Ok(((), _turn)) = prepared else {
-                    return wire::failure();
-                };
-                self.remove_all();
-                // In the turn, so no other change lands between the keys
-                // going and the hooks hearing of it.
-                self.lifecycle.iter().for_each(|hook| hook.cleared());
-                tracing::info!("removed every identity");
-                wire::success()
-            }
+            Request::RemoveIdentity { key_blob } => self.remove_identity(&key_blob, connection),
+            Request::RemoveAllIdentities => self.remove_all_identities(connection),
             // As OpenSSH refuses remote provider adds: a forwarded hop needs
             // only a key's name to re-add it, which would drop its
             // `ssh-add -c`/`-h` constraints.
@@ -1512,36 +1421,142 @@ impl Agent {
                 }
             }
             Request::RemoveSmartcardKey { provider } => {
-                let prepared = self.prepared_turn(|_| {
-                    let change = KeyChange::RemoveProvider {
-                        provider: &provider,
-                    };
-                    match self.manage_allowed(change, connection) {
-                        true => Ok(()),
-                        false => Err(()),
-                    }
-                });
-                let Ok(((), _turn)) = prepared else {
-                    return wire::failure();
-                };
-                match self.remove_smartcard(&provider) {
-                    Ok(true) => {
-                        tracing::info!("removed provider key");
-                        wire::success()
-                    }
-                    Ok(false) => {
-                        tracing::debug!("no such provider key to remove");
-                        wire::failure()
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "cannot remove provider key");
-                        wire::failure()
-                    }
-                }
+                self.remove_smartcard_key(&provider, connection)
             }
             Request::Extension { name, data } => self.handle_extension(&name, &data, connection),
             Request::Unsupported(kind) => {
                 tracing::debug!(kind, "unsupported request");
+                wire::failure()
+            }
+        }
+    }
+
+    /// `ssh-add FILE`: serve `key`, or `cert` with it as its signer, under
+    /// `meta`, unless the policy or the identity's own `ssh-add -h`
+    /// constraint forbids it on this connection.
+    fn add_identity(
+        &self,
+        key: SignerRef,
+        cert: Option<CertKey>,
+        lifetime: Option<u32>,
+        meta: KeyMeta,
+        connection: &Connection,
+    ) -> Vec<u8> {
+        let lifetime = self.lifetime_for(lifetime);
+        // The identity this add replaces: a certificate is
+        // constrained apart from its key.
+        let blob = match &cert {
+            Some(cert) => cert.blob().to_vec(),
+            None => key.key_blob(),
+        };
+        let prepared = self.prepared_turn(|store| {
+            let change = KeyChange::Add {
+                key: key.public_key(),
+                certificate: cert.as_ref(),
+                constraints: KeyConstraints {
+                    lifetime,
+                    confirm: meta.confirm,
+                    destination: &meta.destination,
+                },
+            };
+            if !self.manage_allowed(change, connection) {
+                return Err(());
+            }
+            if !self.may_manage(store, &blob, connection) {
+                tracing::warn!("refused: key not permitted on this connection");
+                return Err(());
+            }
+            Ok(())
+        });
+        let Ok(((), _turn)) = prepared else {
+            return wire::failure();
+        };
+        self.add_held(key, cert, lifetime, Some(meta));
+        wire::success()
+    }
+
+    /// `ssh-add -d`: stop serving the identity `key_blob` names, asking its
+    /// backend to remove it if it is a backend key.
+    fn remove_identity(&self, key_blob: &[u8], connection: &Connection) -> Vec<u8> {
+        let prepared = self.prepared_turn(|store| {
+            let target = self.lookup(store, key_blob).ok().map(|(key, _)| key);
+            let change = KeyChange::Remove {
+                key_blob,
+                key: target.as_ref().map(|t| t.public_key()),
+            };
+            if !self.manage_allowed(change, connection) {
+                return Err(());
+            }
+            if !self.may_manage(store, key_blob, connection) {
+                tracing::warn!("refused: key not permitted on this connection");
+                return Err(());
+            }
+            Ok(self.backend_key(key_blob).is_some())
+        });
+        let Ok((from_backend, _turn)) = prepared else {
+            return wire::failure();
+        };
+        let removed = self.write(|store| {
+            if store.remove_held(key_blob) {
+                Some("removed added key")
+            } else if store.take_cert(key_blob) {
+                Some("removed certificate")
+            } else {
+                None
+            }
+        });
+        if let Some(removed) = removed {
+            tracing::info!("{removed}");
+            wire::success()
+        } else if from_backend && self.backends.iter().any(|b| b.remove(key_blob)) {
+            self.release(key_blob, true);
+            tracing::info!("removed key");
+            wire::success()
+        } else {
+            tracing::debug!("no such key to remove");
+            wire::failure()
+        }
+    }
+
+    /// `ssh-add -D`: drop every identity and tell the hooks.
+    fn remove_all_identities(&self, connection: &Connection) -> Vec<u8> {
+        let prepared = self.prepared_turn(|_| {
+            let allowed = self.manage_allowed(KeyChange::RemoveAll, connection);
+            allowed.then_some(()).ok_or(())
+        });
+        let Ok(((), _turn)) = prepared else {
+            return wire::failure();
+        };
+        self.remove_all();
+        // In the turn, so no other change lands between the keys
+        // going and the hooks hearing of it.
+        self.lifecycle.iter().for_each(|hook| hook.cleared());
+        tracing::info!("removed every identity");
+        wire::success()
+    }
+
+    /// `ssh-add -e PROVIDER`, once the policy allows it.
+    fn remove_smartcard_key(&self, provider: &[u8], connection: &Connection) -> Vec<u8> {
+        let prepared = self.prepared_turn(|_| {
+            let change = KeyChange::RemoveProvider { provider };
+            self.manage_allowed(change, connection)
+                .then_some(())
+                .ok_or(())
+        });
+        let Ok(((), _turn)) = prepared else {
+            return wire::failure();
+        };
+        match self.remove_smartcard(provider) {
+            Ok(true) => {
+                tracing::info!("removed provider key");
+                wire::success()
+            }
+            Ok(false) => {
+                tracing::debug!("no such provider key to remove");
+                wire::failure()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot remove provider key");
                 wire::failure()
             }
         }
@@ -1700,17 +1715,16 @@ impl Agent {
     /// many connections send them; no lock is held through a delay.
     fn handle_unlock(&self, passphrase: &[u8]) -> Vec<u8> {
         loop {
-            let Some(holding) = Holding::enter(self, Turn::Lock) else {
+            let Some(mut turn) = self.lock_turn() else {
                 return wire::failure();
             };
-            let mut state = lock(&self.lock_state);
+            let state = &mut turn.state;
             let now = Instant::now();
             if let Some(wait) = state
                 .next_guess
                 .and_then(|at| at.checked_duration_since(now))
             {
-                drop(state);
-                drop(holding);
+                drop(turn);
                 std::thread::sleep(wait);
                 continue;
             }
@@ -1721,7 +1735,7 @@ impl Agent {
                 return wire::failure();
             }
             if self.locker.unlock(passphrase) {
-                *state = LockState::default();
+                **state = LockState::default();
                 self.lifecycle.iter().for_each(|hook| hook.unlocked());
                 tracing::info!("agent unlocked");
                 return wire::success();
@@ -1734,8 +1748,7 @@ impl Agent {
                 ?delay,
                 "unlock request refused: wrong passphrase"
             );
-            drop(state);
-            drop(holding);
+            drop(turn);
             std::thread::sleep(delay);
             return wire::failure();
         }
@@ -1789,8 +1802,8 @@ impl Agent {
     fn constraints_of(&self, store: &Store, key_blob: &[u8]) -> KeyMeta {
         let constraints = if let Some((_, meta)) = store.held_key(key_blob) {
             Constraints::Own(meta.clone())
-        } else if let Some((_, constraints)) = store.cert(key_blob).map(|i| i.signs_with()) {
-            constraints
+        } else if let Some(identity) = store.cert(key_blob) {
+            identity.constraints()
         } else {
             Constraints::Provider(key_blob.to_vec())
         };
@@ -1814,13 +1827,13 @@ impl Agent {
     /// while it runs (a PIN prompt, say) or after it fails. Once it succeeds
     /// they are recorded again, in case a backend released the key, and its
     /// constraints with it, while re-serving it.
-    fn publish_constrained<T>(
+    fn publish_constrained(
         &self,
         blob: Vec<u8>,
         meta: KeyMeta,
         served: bool,
-        publish: impl FnOnce() -> Result<T, AgentError>,
-    ) -> Result<T, AgentError> {
+        publish: impl FnOnce() -> Result<(), AgentError>,
+    ) -> Result<(), AgentError> {
         let (previous, deferred) = self.write(|store| {
             let previous = store.provider_meta(&blob).cloned();
             let deferred = served && previous.is_some();
@@ -2009,8 +2022,8 @@ impl Agent {
                 );
                 Err(AgentError::UnknownKey)
             }
-            Some(identity) => match identity.signs_with() {
-                (_, Constraints::Provider(blob)) => match self.backend_key(&blob) {
+            Some(identity) => match identity.constraints() {
+                Constraints::Provider(blob) => match self.backend_key(&blob) {
                     Some(key) => Ok((key, Constraints::Provider(blob))),
                     None => {
                         tracing::warn!(
@@ -2020,11 +2033,32 @@ impl Agent {
                         Err(AgentError::UnknownKey)
                     }
                 },
-                held => Ok(held),
+                own => Ok((identity.key.clone(), own)),
             },
             None => Err(AgentError::UnknownKey),
         }
     }
+}
+
+/// Apply `change` to each of `entries` that `touches` picks, then drop
+/// those left empty. Returns whether any was picked; if none was, `entries`
+/// is left as it was, the same `Arc`.
+fn edit<T: Clone>(
+    entries: &mut Arc<Vec<T>>,
+    touches: impl Fn(&T) -> bool,
+    mut change: impl FnMut(&mut T),
+    is_empty: impl Fn(&T) -> bool,
+) -> bool {
+    if !entries.iter().any(&touches) {
+        return false;
+    }
+    let entries = Arc::make_mut(entries);
+    entries
+        .iter_mut()
+        .filter(|e| touches(e))
+        .for_each(&mut change);
+    entries.retain(|e| !is_empty(e));
+    true
 }
 
 /// Whether constraints `meta` let the key be shown on this connection.
