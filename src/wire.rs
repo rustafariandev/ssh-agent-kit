@@ -534,7 +534,11 @@ pub(crate) mod tests {
     /// The constraint-extension bytes for one valid destination constraint:
     /// from the origin to `example.com`, identified by `key(7, "")`.
     pub(crate) fn destination_extension() -> Vec<u8> {
-        let host_key = key(7, "");
+        destination_extension_to(&key(7, ""))
+    }
+
+    /// [`destination_extension`] to the host identified by `host_key`.
+    pub(crate) fn destination_extension_to(host_key: &PublicKey) -> Vec<u8> {
         let mut hostkeys = Vec::new();
         host_key.to_bytes().unwrap().encode(&mut hostkeys).unwrap();
         0u8.encode(&mut hostkeys).unwrap();

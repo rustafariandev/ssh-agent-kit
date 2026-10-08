@@ -13,14 +13,16 @@ use crate::cert::CertKey;
 use crate::testing::MemoryBackend;
 use crate::{
     Agent, Backend, BoxError, Confirm, ConfirmRequest, Connection, Extension, ExtensionContext,
-    ExtensionReply, Lifecycle, ListInfo, Locker, ManageInfo, PassphraseLock, Policy, Removed,
-    SignInfo, SignerRef, SmartcardProvider, wire,
+    ExtensionReply, KeyDecodeError, KeyDecoder, Lifecycle, ListInfo, Locker, ManageInfo,
+    PassphraseLock, Policy, Removed, SignInfo, Signer, SignerRef, SmartcardProvider, wire,
 };
 use ssh_encoding::{Decode, Encode};
+use ssh_key::{HashAlg, PrivateKey, PublicKey, Signature};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Barrier, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{JoinHandle, sleep};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
@@ -1882,4 +1884,849 @@ fn panicking_callbacks_leave_the_agent_working() {
         assert!(agent.identities().is_empty());
         assert_eq!(turns_held(), 0);
     });
+}
+
+// Blocked and re-entrant callbacks.
+
+/// Holds the threads that reach it until it opens.
+#[derive(Default)]
+struct Gate {
+    open: Mutex<bool>,
+    opened: Condvar,
+    reached: AtomicUsize,
+}
+
+impl Gate {
+    fn wait(&self) {
+        self.reached.fetch_add(1, SeqCst);
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+    }
+
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    /// Wait for `threads` to reach the gate.
+    fn holds(&self, threads: usize) {
+        let deadline = Instant::now() + HANG_AFTER;
+        while self.reached.load(SeqCst) < threads {
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {threads} threads reached the gate",
+                self.reached.load(SeqCst)
+            );
+            sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// A key whose signatures wait at a gate, as for a touch.
+struct GatedKey(SignerRef, Arc<Gate>);
+
+impl Signer for GatedKey {
+    fn public_key(&self) -> &PublicKey {
+        self.0.public_key()
+    }
+
+    fn sign(&self, data: &[u8], hash: HashAlg) -> Result<Signature, BoxError> {
+        self.1.wait();
+        self.0.sign(data, hash)
+    }
+}
+
+/// The agent never blocks on a slow key: while signatures wait for a
+/// touch, a confirm prompt for an answer and a provider for a PIN, every
+/// other request carries on, including removing the keys they wait on,
+/// `ssh-add -D` and locking. A provider slow to add a key, which it does in
+/// the key change's turn, holds up only other key changes. Once the waits
+/// end, the requests that waited return.
+#[test]
+fn a_blocked_callback_holds_up_only_its_own_request() {
+    struct GatedConfirm(Arc<Gate>);
+    impl Confirm for GatedConfirm {
+        fn confirm(&self, _: &ConfirmRequest) -> Option<bool> {
+            self.0.wait();
+            Some(true)
+        }
+    }
+    /// [`Cards`] whose `slow` card waits for a PIN, and whose `turn` card
+    /// is slow to add.
+    struct GatedCards {
+        cards: Arc<Cards>,
+        pin: Arc<Gate>,
+        insert: Arc<Gate>,
+    }
+    impl SmartcardProvider for GatedCards {
+        fn resolve(
+            &self,
+            provider: &[u8],
+            pin: &Zeroizing<Vec<u8>>,
+        ) -> Result<SignerRef, BoxError> {
+            if provider == b"slow" {
+                self.pin.wait();
+            }
+            self.cards.resolve(provider, pin)
+        }
+        fn add(
+            &self,
+            provider: &[u8],
+            pin: &Zeroizing<Vec<u8>>,
+            lifetime: Option<u32>,
+        ) -> Result<(), BoxError> {
+            if provider == b"turn" {
+                self.insert.wait();
+            }
+            self.cards.add(provider, pin, lifetime)
+        }
+        fn remove(&self, provider: &[u8]) -> Result<Removed, BoxError> {
+            SmartcardProvider::remove(&*self.cards, provider)
+        }
+    }
+
+    let (touch, insert) = (Arc::new(Gate::default()), Arc::new(Gate::default()));
+    let slow = SignerRef::new(GatedKey(ed25519(0x10, "slow"), Arc::clone(&touch)));
+    let slow_blob = slow.key_blob();
+    let cards = Cards::new(&[("card", 0x12), ("slow", 0x13), ("turn", 0x14)]);
+    let agent = Arc::new(
+        Agent::new()
+            .with_backend(Arc::new(MemoryBackend::new([slow])))
+            .with_backend(Arc::clone(&cards) as _)
+            .with_smartcard(Arc::new(GatedCards {
+                cards,
+                pin: Arc::clone(&touch),
+                insert: Arc::clone(&insert),
+            }))
+            .with_confirm(Arc::new(GatedConfirm(Arc::clone(&touch))))
+            .with_unlock_backoff(Duration::from_millis(1)),
+    );
+    let confirmed = 0x15u8;
+    assert_eq!(agent.handle(&add(confirmed, CONFIRM)), wire::success());
+    let request = |body: Vec<u8>| {
+        let agent = Arc::clone(&agent);
+        std::thread::spawn(move || agent.handle(&body))
+    };
+    let mut waiting = vec![
+        request(sign(&slow_blob)),
+        request(sign(&slow_blob)),
+        request(sign(&blob(confirmed))),
+        request(smartcard("slow", Limits::default(), &[])),
+    ];
+    touch.holds(waiting.len());
+
+    // Never signed with here: the slow key, and the -c key, which waits.
+    let others = [0x16u8, 0x17];
+    let signable: Vec<Vec<u8>> = [0x12, 0x16, 0x17].map(blob).to_vec();
+    let removable: Vec<Vec<u8>> = [0x10, 0x12, 0x15, 0x16, 0x17].map(blob).to_vec();
+    let mut workers = Vec::new();
+    for _ in 0..3 {
+        let (agent, removable) = (Arc::clone(&agent), removable.clone());
+        workers.push(worker("change", move |step| {
+            let limits = *step.rng.pick(&[Limits::default(), HIDDEN]);
+            let (op, body) = match step.rng.below(7) {
+                0 | 1 => ("add", add(*step.rng.pick(&others), limits)),
+                2 => ("remove", remove(step.rng.pick(&removable))),
+                3 => ("remove all", remove_all()),
+                4 => ("add smartcard", smartcard("card", limits, &[])),
+                5 => ("remove smartcard", smartcard_remove("card")),
+                _ => ("remove the slow card", smartcard_remove("slow")),
+            };
+            step.doing(op);
+            agent.handle(&body);
+        }));
+    }
+    for _ in 0..2 {
+        let (agent, signable) = (Arc::clone(&agent), signable.clone());
+        workers.push(worker("read", move |step| {
+            step.doing("list");
+            agent.handle(&list());
+            step.doing("sign");
+            agent.handle(&sign(step.rng.pick(&signable)));
+            step.doing("identities");
+            agent.identities();
+        }));
+    }
+    {
+        let agent = Arc::clone(&agent);
+        workers.push(worker("lock", move |step| {
+            step.doing("lock");
+            agent.handle(&lock(b"pw"));
+            step.rng.pause(500);
+            step.doing("unlock");
+            agent.handle(&unlock(b"pw"));
+        }));
+    }
+    {
+        let agent = Arc::clone(&agent);
+        workers.push(worker("purge", move |step| {
+            step.doing("purge");
+            agent.purge_expired();
+            step.rng.pause(1000);
+        }));
+    }
+    stress(workers);
+
+    // Now a key change waits in its turn as well.
+    waiting.push(request(smartcard("turn", Limits::default(), &[])));
+    insert.holds(1);
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let (agent, signable) = (Arc::clone(&agent), signable.clone());
+        workers.push(worker("read", move |step| {
+            step.doing("list");
+            agent.handle(&list());
+            step.doing("sign");
+            agent.handle(&sign(step.rng.pick(&signable)));
+            step.doing("certificates_for");
+            agent.certificates_for(&local_key(0x16, "stress").1);
+        }));
+    }
+    {
+        let agent = Arc::clone(&agent);
+        let key = ed25519(0x18, "library");
+        let cert = crate::testing::certify(key.public_key().key_data());
+        workers.push(worker("library", move |step| match step.rng.below(4) {
+            0 => {
+                step.doing("add_key");
+                agent.add_key(key.clone(), None);
+            }
+            1 => {
+                step.doing("add_cert_key");
+                agent.add_cert_key(key.clone(), cert.clone(), None);
+            }
+            2 => {
+                step.doing("remove_cert");
+                agent.remove_cert(cert.blob());
+            }
+            _ => {
+                step.doing("remove_key");
+                agent.remove_key(&key.key_blob());
+            }
+        }));
+    }
+    {
+        let agent = Arc::clone(&agent);
+        workers.push(worker("lock", move |step| {
+            step.doing("lock");
+            agent.lock(b"pw");
+            step.rng.pause(500);
+            step.doing("unlock");
+            agent.unlock(b"pw");
+        }));
+    }
+    stress(workers);
+
+    touch.open();
+    insert.open();
+    within("the requests that waited", move || {
+        for request in waiting {
+            request.join().unwrap();
+        }
+    });
+}
+
+thread_local! {
+    /// Whether this thread is calling back into an agent from a
+    /// [`Reentrant`] callback, whose own callbacks then do not.
+    static CALLING_BACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Calls back into the agent from every callback with a random request:
+/// any change, lock or read, on the same thread. The request's own
+/// callbacks do not call back again.
+struct Reentrant {
+    back: Back,
+    on: AtomicBool,
+    calls: AtomicUsize,
+}
+
+impl Reentrant {
+    fn new() -> Arc<Self> {
+        Arc::new(Reentrant {
+            back: Back::default(),
+            on: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn call_back(&self) {
+        if !self.on.load(SeqCst) || CALLING_BACK.get() {
+            return;
+        }
+        let Some(agent) = self.back.agent() else {
+            return;
+        };
+        static STATE: AtomicU64 = AtomicU64::new(3);
+        let mut rng = Rng::new(STATE.fetch_add(0x9E37_79B9_7F4A_7C15, SeqCst));
+        let seed = 0x40 + rng.below(3) as u8;
+        let limits = *rng.pick(&[Limits::default(), CONFIRM, HIDDEN]);
+        CALLING_BACK.set(true);
+        match rng.below(13) {
+            0 => drop(agent.handle(&add(seed, limits))),
+            1 => drop(agent.handle(&remove(&blob(seed)))),
+            2 => drop(agent.handle(&remove_all())),
+            3 => drop(agent.handle(&list())),
+            4 => drop(agent.handle(&sign(&blob(seed)))),
+            5 => drop(agent.handle(&lock(b"pw"))),
+            6 => drop(agent.handle(&unlock(b"pw"))),
+            7 => drop(agent.handle(&smartcard("card", limits, &[]))),
+            8 => drop(agent.handle(&smartcard_remove("card"))),
+            9 => drop(agent.release(&blob(0x43), rng.chance(50))),
+            10 => drop(agent.lock(b"pw") && agent.unlock(b"pw")),
+            11 => drop(agent.handle(&extension("reenter@example.com"))),
+            _ => {
+                agent.purge_expired();
+                agent.identities();
+            }
+        }
+        CALLING_BACK.set(false);
+        self.calls.fetch_add(1, SeqCst);
+    }
+}
+
+/// A key that calls back into the agent as it signs.
+struct ReentrantKey(SignerRef, Arc<Reentrant>);
+
+impl ReentrantKey {
+    fn wrap(key: SignerRef, reentrant: &Arc<Reentrant>) -> SignerRef {
+        SignerRef::new(ReentrantKey(key, Arc::clone(reentrant)))
+    }
+}
+
+impl Signer for ReentrantKey {
+    fn public_key(&self) -> &PublicKey {
+        self.0.public_key()
+    }
+
+    fn sign(&self, data: &[u8], hash: HashAlg) -> Result<Signature, BoxError> {
+        self.1.call_back();
+        self.0.sign(data, hash)
+    }
+}
+
+/// [`Cards`], and the keys they serve, calling back into the agent.
+struct ReentrantCards(Arc<Cards>, Arc<Reentrant>);
+
+impl ReentrantCards {
+    fn wrap(&self, keys: Vec<SignerRef>) -> Vec<SignerRef> {
+        keys.into_iter()
+            .map(|key| ReentrantKey::wrap(key, &self.1))
+            .collect()
+    }
+}
+
+impl Backend for ReentrantCards {
+    fn identities(&self) -> Vec<SignerRef> {
+        self.1.call_back();
+        self.wrap(self.0.identities())
+    }
+    fn known(&self) -> Vec<SignerRef> {
+        self.1.call_back();
+        self.wrap(self.0.known())
+    }
+    fn remove(&self, key_blob: &[u8]) -> bool {
+        self.1.call_back();
+        Backend::remove(&*self.0, key_blob)
+    }
+    fn remove_all(&self) {
+        self.1.call_back();
+        self.0.remove_all();
+    }
+    fn purge_expired(&self) {
+        self.1.call_back();
+    }
+}
+
+impl SmartcardProvider for ReentrantCards {
+    fn resolve(&self, provider: &[u8], pin: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+        self.1.call_back();
+        let key = self.0.resolve(provider, pin)?;
+        Ok(ReentrantKey::wrap(key, &self.1))
+    }
+    fn add(
+        &self,
+        provider: &[u8],
+        pin: &Zeroizing<Vec<u8>>,
+        lifetime: Option<u32>,
+    ) -> Result<(), BoxError> {
+        self.1.call_back();
+        self.0.add(provider, pin, lifetime)
+    }
+    fn remove(&self, provider: &[u8]) -> Result<Removed, BoxError> {
+        self.1.call_back();
+        SmartcardProvider::remove(&*self.0, provider)
+    }
+}
+
+/// Allows everything, answers every confirm yes and hears every event,
+/// calling back into the agent each time.
+struct ReentrantUser(Arc<Reentrant>);
+
+impl Policy for ReentrantUser {
+    fn allow_sign(&self, _: &SignInfo<'_>) -> bool {
+        self.0.call_back();
+        true
+    }
+    fn signed(&self, _: &SignInfo<'_>) {
+        self.0.call_back();
+    }
+    fn allow_list(&self, _: &ListInfo<'_>) -> bool {
+        self.0.call_back();
+        true
+    }
+    fn allow_manage(&self, _: &ManageInfo<'_>) -> bool {
+        self.0.call_back();
+        true
+    }
+}
+
+impl Confirm for ReentrantUser {
+    fn confirm(&self, _: &ConfirmRequest) -> Option<bool> {
+        self.0.call_back();
+        Some(true)
+    }
+}
+
+impl Lifecycle for ReentrantUser {
+    fn locked(&self) {
+        self.0.call_back();
+    }
+    fn unlocked(&self) {
+        self.0.call_back();
+    }
+    fn cleared(&self) {
+        self.0.call_back();
+    }
+}
+
+impl Extension for ReentrantUser {
+    fn name(&self) -> &str {
+        "reenter@example.com"
+    }
+    fn handle(&self, _: &ExtensionContext, _: &[u8]) -> ExtensionReply {
+        self.0.call_back();
+        ExtensionReply::Success
+    }
+}
+
+impl KeyDecoder for ReentrantUser {
+    fn key_types(&self) -> &[&str] {
+        &["ssh-ed25519"]
+    }
+    fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<SignerRef, KeyDecodeError> {
+        self.0.call_back();
+        let key = crate::local::decode(key_type, reader).map(SignerRef::new)?;
+        Ok(ReentrantKey::wrap(key, &self.0))
+    }
+}
+
+/// [`PassphraseLock`], calling back into the agent first.
+struct ReentrantLock(PassphraseLock, Arc<Reentrant>);
+
+impl Locker for ReentrantLock {
+    fn is_locked(&self) -> bool {
+        self.1.call_back();
+        self.0.is_locked()
+    }
+    fn lock(&self, passphrase: &[u8]) -> bool {
+        self.1.call_back();
+        self.0.lock(passphrase)
+    }
+    fn unlock(&self, passphrase: &[u8]) -> bool {
+        self.1.call_back();
+        self.0.unlock(passphrase)
+    }
+}
+
+/// Every callback the agent makes, inside a turn or not, calls back into
+/// it with any request, while requests of every kind race: each one
+/// returns (refused, at worst), no turn is left held, and once the calling
+/// back stops every kind of request works.
+#[test]
+fn every_callback_may_call_back_into_the_agent() {
+    let reentrant = Reentrant::new();
+    let cards = Arc::new(ReentrantCards(
+        Cards::new(&[("card", 0x43), ("other", 0x44)]),
+        Arc::clone(&reentrant),
+    ));
+    let user = ReentrantUser(Arc::clone(&reentrant));
+    let agent = Arc::new(
+        Agent::new()
+            .with_backend(Arc::clone(&cards) as _)
+            .with_smartcard(Arc::clone(&cards) as _)
+            .with_policy(Arc::new(ReentrantUser(Arc::clone(&reentrant))))
+            .with_confirm(Arc::new(ReentrantUser(Arc::clone(&reentrant))))
+            .with_lifecycle(Arc::new(ReentrantUser(Arc::clone(&reentrant))))
+            .with_locker(Arc::new(ReentrantLock(
+                PassphraseLock::default(),
+                Arc::clone(&reentrant),
+            )))
+            .with_extension(ReentrantUser(Arc::clone(&reentrant)))
+            .with_key_type(user)
+            .with_unlock_backoff(Duration::from_millis(1)),
+    );
+    reentrant.back.set(&agent);
+    let blobs: Vec<Vec<u8>> = (0x40..=0x46).map(blob).collect();
+
+    let mut workers = Vec::new();
+    for _ in 0..6 {
+        let (agent, blobs) = (Arc::clone(&agent), blobs.clone());
+        let mut connection = Connection::default();
+        workers.push(worker("churn", move |step| {
+            let seed = 0x40 + step.rng.below(3) as u8;
+            let limits = Limits {
+                confirm: step.rng.chance(30),
+                lifetime: step.rng.chance(10).then_some(1),
+                hidden: step.rng.chance(20),
+            };
+            let card = *step.rng.pick(&["card", "other"]);
+            let (op, body) = match step.rng.below(12) {
+                0 | 1 => ("add", add(seed, limits)),
+                2 => ("remove", remove(step.rng.pick(&blobs))),
+                3 => ("remove all", remove_all()),
+                4 | 5 => ("sign", sign(step.rng.pick(&blobs))),
+                6 => ("list", list()),
+                7 => ("lock", lock(b"pw")),
+                8 => ("unlock", unlock(b"pw")),
+                9 => ("add smartcard", smartcard(card, limits, &[])),
+                10 => ("remove smartcard", smartcard_remove(card)),
+                _ => ("extension", extension("reenter@example.com")),
+            };
+            step.doing(op);
+            if step.rng.chance(5) {
+                connection = Connection::default();
+            }
+            agent.handle_in(&body, &mut connection);
+            assert_eq!(turns_held(), 0, "{op} left a turn held");
+        }));
+    }
+    {
+        let (agent, cards) = (Arc::clone(&agent), Arc::clone(&cards));
+        workers.push(worker("backend drops", move |step| {
+            let blob = blob(*step.rng.pick(&[0x43, 0x44]));
+            step.doing("drop and release");
+            let served = cards.0.drop_key(&blob);
+            agent.release(&blob, served);
+            assert_eq!(turns_held(), 0, "a release left a turn held");
+            step.rng.pause(2000);
+        }));
+    }
+    stress(workers);
+    assert!(reentrant.calls.load(SeqCst) > 0, "nothing called back");
+
+    reentrant.on.store(false, SeqCst);
+    within("requests once the calling back stopped", move || {
+        agent.unlock(b"pw");
+        assert!(!agent.is_locked());
+        assert_eq!(agent.handle(&remove_all()), wire::success());
+        let plain = 0x45;
+        assert_eq!(
+            agent.handle(&add(plain, Limits::default())),
+            wire::success()
+        );
+        assert!(signed(&agent.handle(&sign(&blob(plain)))));
+        assert_eq!(
+            agent.handle(&smartcard("card", Limits::default(), &[])),
+            wire::success()
+        );
+        assert!(signed(&agent.handle(&sign(&blob(0x43)))));
+        assert_eq!(listed(&agent.handle(&list())).len(), 2);
+        assert_eq!(agent.handle(&lock(b"pw")), wire::success());
+        assert_eq!(agent.handle(&unlock(b"pw")), wire::success());
+        assert_eq!(agent.handle(&remove_all()), wire::success());
+        assert!(agent.identities().is_empty());
+        assert_eq!(turns_held(), 0);
+    });
+}
+
+// Lost updates.
+
+/// What a thread changes, it sees at once, whatever other threads change
+/// meanwhile: a key it added is listed, once, and signs until it removes
+/// it, as does a certificate it added, through the protocol or the
+/// library's calls. Another change landing alongside never loses one.
+#[test]
+fn each_thread_sees_its_own_changes() {
+    let cards = Cards::new(&[("card", 0x30)]);
+    let agent = Arc::new(
+        Agent::new()
+            .with_backend(Arc::clone(&cards) as _)
+            .with_smartcard(Arc::clone(&cards) as _)
+            .with_confirm(Arc::new(DenyConfirm::default())),
+    );
+    let shown = |agent: &Agent, blob: &[u8]| {
+        listed(&agent.handle(&list()))
+            .iter()
+            .filter(|b| *b == blob)
+            .count()
+    };
+
+    let mut workers = Vec::new();
+    for seed in 0x31..=0x34u8 {
+        let agent = Arc::clone(&agent);
+        let key = ed25519(seed, "stress");
+        let key_blob = key.key_blob();
+        let cert = crate::testing::certify(key.public_key().key_data());
+        workers.push(worker("owner", move |step| {
+            if step.rng.chance(50) {
+                step.doing("add");
+                until_done(&agent, &add(seed, Limits::default()));
+            } else {
+                step.doing("add_key");
+                agent.add_key(key.clone(), None);
+            }
+            step.doing("check the key is served");
+            assert_eq!(shown(&agent, &key_blob), 1, "key {seed:#x}, just added");
+            assert!(
+                signed(&agent.handle(&sign(&key_blob))),
+                "key {seed:#x}, just added, did not sign"
+            );
+            if step.rng.chance(50) {
+                step.doing("add_cert_key");
+                agent.add_cert_key(key.clone(), cert.clone(), None);
+                assert_eq!(shown(&agent, cert.blob()), 1, "{seed:#x}'s certificate");
+                assert!(
+                    signed(&agent.handle(&sign(cert.blob()))),
+                    "{seed:#x}'s certificate, just added, did not sign"
+                );
+                step.doing("remove_cert");
+                assert!(agent.remove_cert(cert.blob()), "{seed:#x}'s certificate");
+                assert_eq!(shown(&agent, cert.blob()), 0, "{seed:#x}'s certificate");
+            }
+            if step.rng.chance(50) {
+                step.doing("remove");
+                until_done(&agent, &remove(&key_blob));
+            } else {
+                step.doing("remove_key");
+                assert!(agent.remove_key(&key_blob), "key {seed:#x} was gone");
+            }
+            step.doing("check the key is gone");
+            assert_eq!(shown(&agent, &key_blob), 0, "key {seed:#x}, just removed");
+            assert!(
+                !signed(&agent.handle(&sign(&key_blob))),
+                "key {seed:#x}, just removed, signed"
+            );
+        }));
+    }
+    for _ in 0..2 {
+        let agent = Arc::clone(&agent);
+        workers.push(worker("churn", move |step| {
+            let seed = 0x35 + step.rng.below(3) as u8;
+            let limits = Limits {
+                confirm: step.rng.chance(30),
+                lifetime: step.rng.chance(20).then_some(1),
+                hidden: step.rng.chance(30),
+            };
+            let (op, body) = match step.rng.below(5) {
+                0 | 1 => ("add", add(seed, limits)),
+                2 => ("remove", remove(&blob(seed))),
+                3 => ("add smartcard", smartcard("card", limits, &[])),
+                _ => ("remove smartcard", smartcard_remove("card")),
+            };
+            step.doing(op);
+            agent.handle(&body);
+        }));
+    }
+    {
+        let (agent, cards) = (Arc::clone(&agent), Arc::clone(&cards));
+        workers.push(worker("backend drops", move |step| {
+            step.doing("drop and release");
+            let card = blob(0x30);
+            let served = cards.drop_key(&card);
+            agent.release(&card, served);
+            step.doing("purge");
+            agent.purge_expired();
+            step.rng.pause(1000);
+        }));
+    }
+    {
+        let agent = Arc::clone(&agent);
+        workers.push(worker("list", move |step| {
+            step.doing("list");
+            let mut shown = listed(&agent.handle(&list()));
+            let count = shown.len();
+            shown.sort();
+            shown.dedup();
+            assert_eq!(shown.len(), count, "an identity was listed twice");
+        }));
+    }
+    stress(workers);
+}
+
+// Session bindings.
+
+/// `body`, an add or smartcard add with no constraints, restricted with
+/// `ssh-add -h` to the host whose key is `host`.
+fn to_host(mut body: Vec<u8>, host: &PublicKey) -> Vec<u8> {
+    body[0] = match body[0] {
+        wire::SSH2_AGENTC_ADD_IDENTITY => wire::SSH2_AGENTC_ADD_ID_CONSTRAINED,
+        wire::SSH_AGENTC_ADD_SMARTCARD_KEY => wire::SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED,
+        other => panic!("not an unconstrained add: {other}"),
+    };
+    body.extend_from_slice(&wire::tests::destination_extension_to(host));
+    body
+}
+
+/// A `session-bind@openssh.com` request binding `session_id` to `host`.
+fn session_bind(host: &PrivateKey, session_id: &[u8]) -> Vec<u8> {
+    let mut body = extension(crate::destination::SESSION_BIND);
+    host.public_key()
+        .to_bytes()
+        .unwrap()
+        .encode(&mut body)
+        .unwrap();
+    session_id.encode(&mut body).unwrap();
+    let signature: Signature = signature::Signer::sign(host, session_id);
+    let mut signed = Vec::new();
+    signature.encode(&mut signed).unwrap();
+    signed.encode(&mut body).unwrap();
+    0u8.encode(&mut body).unwrap();
+    body
+}
+
+/// What `ssh` asks the agent to sign to authenticate on `session_id`
+/// with the ed25519 key `key_blob`.
+fn userauth(session_id: &[u8], key_blob: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    session_id.encode(&mut data).unwrap();
+    data.push(50);
+    "ferris".encode(&mut data).unwrap();
+    "ssh-connection".encode(&mut data).unwrap();
+    "publickey".encode(&mut data).unwrap();
+    data.push(1);
+    "ssh-ed25519".encode(&mut data).unwrap();
+    key_blob.encode(&mut data).unwrap();
+    data
+}
+
+/// `ssh-add -h` keys under churn, seen from connections bound with
+/// `session-bind@openssh.com`, and bound afresh now and then: one bound to
+/// the host they are restricted to lists them and authenticates with them
+/// whenever they are surely served; one bound to another host never does.
+/// One worker alone adds and removes them, counting an odd epoch while
+/// they are surely served.
+#[test]
+fn bound_connections_keep_to_their_destinations() {
+    use ssh_key::private::Ed25519Keypair;
+    let host = |seed: u8| PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
+    let (allowed, refused) = (host(0x5a), host(0x5b));
+    let cards = Cards::new(&[("card", 0x50), ("other", 0x51)]);
+    let agent = Arc::new(
+        Agent::new()
+            .with_backend(Arc::clone(&cards) as _)
+            .with_smartcard(Arc::clone(&cards) as _),
+    );
+    let local = 0x52u8;
+    let restricted = [blob(0x50), blob(local)];
+    let epoch = Arc::new(AtomicU64::new(0));
+
+    let mut workers = Vec::new();
+    {
+        let (agent, epoch) = (Arc::clone(&agent), Arc::clone(&epoch));
+        let to = allowed.public_key().clone();
+        workers.push(worker("holder", move |step| {
+            step.doing("add -h");
+            until_done(&agent, &to_host(add(local, Limits::default()), &to));
+            step.doing("add smartcard -h");
+            let card = smartcard("card", Limits::default(), &[]);
+            until_done(&agent, &to_host(card, &to));
+            epoch.fetch_add(1, SeqCst);
+            sleep(Duration::from_millis(10));
+            step.rng.pause(10_000);
+            epoch.fetch_add(1, SeqCst);
+            step.doing("remove");
+            until_done(&agent, &remove(&blob(local)));
+            step.doing("remove smartcard");
+            until_done(&agent, &smartcard_remove("card"));
+            step.rng.pause(1000);
+        }));
+    }
+    for _ in 0..2 {
+        let agent = Arc::clone(&agent);
+        let to = refused.public_key().clone();
+        workers.push(worker("churn", move |step| {
+            let seed = 0x53 + step.rng.below(3) as u8;
+            let limits = *step.rng.pick(&[CONFIRM, HIDDEN, Limits::default()]);
+            let (op, body) = match step.rng.below(5) {
+                0 => ("add", add(seed, limits)),
+                1 => (
+                    "add -h elsewhere",
+                    to_host(add(seed, Limits::default()), &to),
+                ),
+                2 => ("remove", remove(&blob(seed))),
+                3 => ("add smartcard", smartcard("other", limits, &[])),
+                _ => ("remove smartcard", smartcard_remove("other")),
+            };
+            step.doing(op);
+            agent.handle(&body);
+        }));
+    }
+    let checked = Arc::new(AtomicUsize::new(0));
+    for (index, permitted) in [true, true, false, false].into_iter().enumerate() {
+        let (agent, epoch, restricted) =
+            (Arc::clone(&agent), Arc::clone(&epoch), restricted.clone());
+        let checked = Arc::clone(&checked);
+        let host = if permitted { &allowed } else { &refused }.clone();
+        let session_id = format!("session {index}").into_bytes();
+        // Bound through the agent, as `ssh` does, racing the other requests.
+        let bound = {
+            let (agent, bind) = (Arc::clone(&agent), session_bind(&host, &session_id));
+            move || {
+                let mut connection = Connection::default();
+                let reply = agent.handle_in(&bind, &mut connection);
+                assert_eq!(reply, wire::success(), "session-bind refused");
+                connection
+            }
+        };
+        let mut connection = bound();
+        workers.push(worker("bound connection", move |step| {
+            if step.rng.chance(5) {
+                step.doing("session-bind");
+                connection = bound();
+            }
+            let key = step.rng.below(restricted.len());
+            let (op, body) = match step.rng.below(2) {
+                0 => ("list", list()),
+                _ => (
+                    "sign",
+                    sign_body(&restricted[key], &userauth(&session_id, &restricted[key])),
+                ),
+            };
+            step.doing(op);
+            let before = epoch.load(SeqCst);
+            let reply = agent.handle_in(&body, &mut connection);
+            let after = epoch.load(SeqCst);
+            let surely_served = before == after && before % 2 == 1;
+            match (op, permitted) {
+                ("list", true) if surely_served => {
+                    checked.fetch_add(1, SeqCst);
+                    let shown = listed(&reply);
+                    for (key, blob) in restricted.iter().enumerate() {
+                        assert!(shown.contains(blob), "-h key {key} not listed to its host");
+                    }
+                }
+                ("sign", true) if surely_served => {
+                    checked.fetch_add(1, SeqCst);
+                    assert!(signed(&reply), "-h key {key} did not sign for its host");
+                }
+                ("list", false) => {
+                    let shown = listed(&reply);
+                    let leaked = restricted.iter().position(|b| shown.contains(b));
+                    assert_eq!(leaked, None, "-h key listed to another host");
+                }
+                ("sign", false) => {
+                    assert!(!signed(&reply), "-h key {key} signed for another host");
+                }
+                _ => {}
+            }
+        }));
+    }
+    stress(workers);
+    assert!(
+        checked.load(SeqCst) > 0,
+        "the keys were never surely served to their host"
+    );
 }
