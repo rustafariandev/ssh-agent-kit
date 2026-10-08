@@ -29,9 +29,10 @@ where keys come from and what is allowed. Out of the box it supports:
 | serve over something other than a unix socket  | `Listener` + `Stream`        | `serve`                 |
 | wrap the agent in your own type                | `Handler`                    | `serve`                 |
 
-The crate is synchronous. The server runs one thread per connection, so a
-backend may block (waiting for a touch, for example) without holding up
-other clients. After every signature the agent checks it against the key
+The agent never blocks on a slow key. The crate is synchronous and the
+server runs one thread per connection, so a backend may block (waiting for
+a touch, for example) while other clients keep listing, signing with other
+keys, locking and removing keys. After every signature the agent checks it against the key
 before it leaves.
 
 ## Example

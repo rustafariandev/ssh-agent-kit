@@ -31,9 +31,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! Everything is synchronous: the server runs one thread per connection,
-//! and a backend may block (waiting for a touch, say) without holding up
-//! other clients.
+//! The agent never blocks on a slow key. Everything is synchronous and the
+//! server runs one thread per connection, so a backend may block (waiting
+//! for a touch, say) while other clients keep listing, signing with other
+//! keys, locking and removing keys.
 
 pub mod agent;
 pub mod backend;
