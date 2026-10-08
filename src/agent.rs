@@ -2079,7 +2079,7 @@ fn session_bind(data: &[u8], connection: &mut Connection) -> Result<(), destinat
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ssh_encoding::Encode;
     use std::sync::atomic::Ordering;
@@ -2092,7 +2092,7 @@ mod tests {
         own.expect("the key is served").expires = Some(Instant::now());
     }
 
-    fn local_key(seed: u8, comment: &str) -> (Vec<u8>, PublicKey) {
+    pub(crate) fn local_key(seed: u8, comment: &str) -> (Vec<u8>, PublicKey) {
         use ssh_key::private::Ed25519Keypair;
         let pair = Ed25519Keypair::from_seed(&[seed; 32]);
         let public = PublicKey::new(ssh_key::public::KeyData::Ed25519(pair.public), comment);
@@ -3002,7 +3002,7 @@ mod tests {
         assert!(!signs(cert.blob()), "the certificate lost its constraint");
     }
 
-    fn ed25519(seed: u8, comment: &str) -> SignerRef {
+    pub(crate) fn ed25519(seed: u8, comment: &str) -> SignerRef {
         let pair = ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]);
         let mut body = Vec::new();
         pair.encode(&mut body).unwrap();
@@ -3012,7 +3012,7 @@ mod tests {
             .unwrap()
     }
 
-    fn sign_body(blob: &[u8], data: &[u8]) -> Vec<u8> {
+    pub(crate) fn sign_body(blob: &[u8], data: &[u8]) -> Vec<u8> {
         let mut sign = vec![wire::SSH2_AGENTC_SIGN_REQUEST];
         blob.encode(&mut sign).unwrap();
         data.encode(&mut sign).unwrap();

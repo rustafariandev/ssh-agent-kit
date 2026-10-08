@@ -47,6 +47,8 @@ pub mod lock;
 pub mod policy;
 pub mod server;
 pub mod signer;
+#[cfg(test)]
+mod stress;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 pub mod wire;
