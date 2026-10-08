@@ -2085,6 +2085,22 @@ pub(crate) mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
+    /// What `agent`'s store holds: keys added with `ssh-add FILE`, what
+    /// `ssh-add -s` attached, and the backend keys whose changes it
+    /// remembers.
+    pub(crate) fn store_sizes(agent: &Agent) -> (usize, usize, usize) {
+        let store = agent.snapshot();
+        (store.held.len(), store.provider.len(), store.changed.len())
+    }
+
+    /// [`super::REMEMBERED_CHANGES`], for the stress tests.
+    pub(crate) const REMEMBERED_CHANGES: usize = super::REMEMBERED_CHANGES;
+
+    /// How many of any agent's turns this thread holds.
+    pub(crate) fn turns_held() -> usize {
+        HELD.with(|held| held.borrow().len())
+    }
+
     /// Make the added key at `index` in `store` expire now, as if its
     /// `ssh-add -t` lifetime had run out.
     fn expire_own(store: &mut Store, index: usize) {
