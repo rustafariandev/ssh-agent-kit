@@ -1232,7 +1232,8 @@ fn a_locked_agent_refuses_everything() {
         step.doing("lock");
         assert!(agent.lock(b"pw"));
         epoch.fetch_add(1, SeqCst);
-        step.rng.pause(3000);
+        sleep(Duration::from_millis(10));
+        step.rng.pause(10_000);
         epoch.fetch_add(1, SeqCst);
         step.doing("unlock");
         assert!(agent.unlock(b"pw"));
