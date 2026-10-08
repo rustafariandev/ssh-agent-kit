@@ -21,9 +21,11 @@ use zeroize::Zeroizing;
 ///
 /// [`Self::remove`] and [`Self::remove_all`] are called while the agent
 /// commits a key change, which it does one at a time. A request that
-/// changes keys (through [`Agent::handle`](crate::Agent::handle)) made from
-/// one of them is refused; one made on another thread while holding a lock
-/// they take waits for the commit to finish, so never returns.
+/// changes keys, locks or unlocks (through
+/// [`Agent::handle`](crate::Agent::handle), [`Agent::lock`](crate::Agent::lock)
+/// or [`Agent::unlock`](crate::Agent::unlock)) made from one of them is
+/// refused; one made on another thread while holding a lock they take waits
+/// for the commit to finish, so never returns.
 /// [`Agent::release`](crate::Agent::release) and the agent's other methods
 /// may be called. The other methods are called with no lock held.
 pub trait Backend: Send + Sync {
@@ -73,9 +75,11 @@ pub struct Removed {
 /// attached certificates around these calls.
 ///
 /// [`Self::add`] and [`Self::remove`] are called while the agent commits a
-/// key change, which it does one at a time: a request that changes keys
-/// (through [`Agent::handle`](crate::Agent::handle)) made from one is
-/// refused, and a slow call holds up other connections' key changes (not
+/// key change, which it does one at a time: a request that changes keys,
+/// locks or unlocks (through [`Agent::handle`](crate::Agent::handle),
+/// [`Agent::lock`](crate::Agent::lock) or
+/// [`Agent::unlock`](crate::Agent::unlock)) made from one is refused, and a
+/// slow call holds up other connections' key changes (not
 /// their listings or signatures) until it returns. [`Self::resolve`] is
 /// called before, with no lock held, so a PIN prompt there holds up no
 /// one.
@@ -103,10 +107,12 @@ pub trait Lifecycle: Send + Sync {
     /// `ssh-add -x` locked the agent.
     ///
     /// Called before the agent is locked or unlocked again, so the hooks
-    /// hear of each in the order they happened: a lock or unlock asked for
-    /// from here (through [`Agent::handle`](crate::Agent::handle),
+    /// hear of each in the order they happened: a lock, unlock or key change
+    /// asked for from here (through [`Agent::handle`](crate::Agent::handle),
     /// [`Agent::lock`](crate::Agent::lock) or
-    /// [`Agent::unlock`](crate::Agent::unlock)) fails.
+    /// [`Agent::unlock`](crate::Agent::unlock)) fails. To change keys on
+    /// unlock, do it once the hook has returned, such as from another
+    /// thread.
     fn locked(&self) {}
 
     /// `ssh-add -X` unlocked it. Called as [`Self::locked`] is.
@@ -114,8 +120,10 @@ pub trait Lifecycle: Send + Sync {
 
     /// `ssh-add -D` removed every identity. Called before another key
     /// change can land, while the agent commits this one: a request that
-    /// changes keys (through [`Agent::handle`](crate::Agent::handle)) made
-    /// from here is refused.
+    /// changes keys, locks or unlocks (through
+    /// [`Agent::handle`](crate::Agent::handle),
+    /// [`Agent::lock`](crate::Agent::lock) or
+    /// [`Agent::unlock`](crate::Agent::unlock)) made from here is refused.
     fn cleared(&self) {}
 }
 

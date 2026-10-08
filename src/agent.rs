@@ -23,11 +23,14 @@
 //!    calls back into the agent from it and expects an answer, a refusal or
 //!    otherwise, within a timeout rather than a hang.
 //!
-//! A key change or unlock asked for from a callback holding that same lock,
-//! on the same thread, is refused rather than left waiting on itself
-//! (`Holding`). One asked for on another thread while that thread holds a
-//! lock the callback is waiting for is a cycle through user code that
-//! the agent cannot see; rule 1 keeps it to the calls listed there.
+//! A key change, lock or unlock asked for from a callback made while either
+//! lock is held, on the same thread, is refused (`Holding`): the same lock
+//! would wait on itself, and the other could wait on a thread that holds it
+//! and is itself waiting for the lock this one holds, as a `cleared` hook
+//! that locks the agent and an `unlocked` hook that adds a key would. One
+//! asked for on another thread while that thread holds a lock the callback
+//! is waiting for is a cycle through user code that the agent cannot see;
+//! rule 1 keeps it to the calls listed there.
 
 use crate::backend::{Backend, Expiring, Lifecycle, SmartcardProvider};
 use crate::cert::{AssociatedCerts, CertKey};
@@ -629,23 +632,32 @@ thread_local! {
 }
 
 /// Records, while it lives, that this thread holds `turn` of one agent, so
-/// that a callback on this thread asking for it again is refused rather
-/// than left waiting on itself.
+/// that a callback on this thread asking for either turn is refused rather
+/// than left waiting on itself or on a thread that waits for this one.
 struct Holding {
     agent: usize,
     turn: Turn,
 }
 
 impl Holding {
-    /// Record `turn` of `agent`, unless this thread holds it already.
+    /// Record `turn` of `agent`, unless this thread holds one of its turns
+    /// already: the same one would wait on itself, and the other on any
+    /// thread holding it while it waits for the one this thread holds.
     fn enter(agent: &Agent, turn: Turn) -> Option<Holding> {
         let agent = std::ptr::from_ref(agent) as usize;
-        let held = HELD.with(|held| held.borrow().contains(&(agent, turn)));
-        if held {
+        let holding = HELD.with(|held| {
+            held.borrow()
+                .iter()
+                .find(|(held, _)| *held == agent)
+                .map(|(_, turn)| *turn)
+        });
+        if let Some(holding) = holding {
             tracing::error!(
                 ?turn,
-                "refused: asked for from a callback of the same request, on the same \
-                 thread, so it would wait on itself"
+                ?holding,
+                "refused: asked for from a callback made while this thread holds one \
+                 of the agent's turns, so it could wait on itself or on another thread \
+                 waiting for this one"
             );
             return None;
         }
@@ -887,7 +899,8 @@ impl Agent {
 
     /// Lock with `passphrase`; fails if already locked, as in OpenSSH. The
     /// [`Lifecycle::locked`] hooks run before any other lock or unlock, and
-    /// one asked for from a hook, on the same thread, fails.
+    /// one asked for from a hook or from a key change's callback, on the same
+    /// thread, fails.
     pub fn lock(&self, passphrase: &[u8]) -> bool {
         let Some(_holding) = Holding::enter(self, Turn::Lock) else {
             return false;
@@ -3842,6 +3855,61 @@ mod tests {
         assert_eq!(outer, wire::success());
         assert_eq!(*hook.relocked.lock().unwrap(), Some(false));
         assert!(!agent.is_locked());
+    }
+
+    /// A callback made while one of the agent's turns is held is refused the
+    /// other: a `cleared` hook's lock and an `unlocked` hook's key change
+    /// fail rather than wait, since on two threads at once each would wait
+    /// for the other's.
+    #[test]
+    fn a_hook_is_refused_the_other_turn() {
+        struct Crosses {
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            locked: Mutex<Option<bool>>,
+            added: Mutex<Option<Vec<u8>>>,
+        }
+        impl Lifecycle for Crosses {
+            fn cleared(&self) {
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                *self.locked.lock().unwrap() = Some(agent.lock(b"hunter2"));
+            }
+            fn unlocked(&self) {
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                let (add, _) = local_key(0x3f, "inner@example.com");
+                *self.added.lock().unwrap() = Some(agent.handle(&add));
+            }
+        }
+
+        let hook = Arc::new(Crosses {
+            agent: std::sync::OnceLock::new(),
+            locked: Mutex::default(),
+            added: Mutex::default(),
+        });
+        let agent = Arc::new(Agent::new().with_lifecycle(Arc::clone(&hook) as _));
+        let _ = hook.agent.set(Arc::downgrade(&agent));
+        let mut unlock = vec![wire::SSH_AGENTC_UNLOCK];
+        b"hunter2".as_slice().encode(&mut unlock).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let cleared = agent.handle(&[wire::SSH_AGENTC_REMOVE_ALL_IDENTITIES]);
+                let locked = agent.lock(b"hunter2");
+                let _ = done.send((cleared, locked, agent.handle(&unlock)));
+            });
+        }
+        let (cleared, locked, unlocked) = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a hook asking for the other turn deadlocked");
+        assert_eq!(cleared, wire::success());
+        assert_eq!(*hook.locked.lock().unwrap(), Some(false));
+        assert!(
+            locked,
+            "the cleared hook's refused lock left the agent locked"
+        );
+        assert_eq!(unlocked, wire::success());
+        assert_eq!(*hook.added.lock().unwrap(), Some(wire::failure()));
+        assert!(agent.public_keys().is_empty());
     }
 
     /// A lock sent while an unlock's hooks run waits for them, so hooks

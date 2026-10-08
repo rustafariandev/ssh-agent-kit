@@ -64,6 +64,13 @@ follows [Semantic Versioning](https://semver.org/).
   accepting connections until it returned. Ticks now run on a thread of
   their own. The ticker holds the handler only while it ticks, so the
   agent and its keys go with their last owner once `serve` returns.
+- A `cleared` hook, a backend's `remove`/`remove_all` or a provider's
+  `add`/`remove` that locked or unlocked the agent could deadlock with an
+  `ssh-add -X` whose `unlocked` hook changed keys, each waiting for the
+  other's lock. A callback made while either is held is now refused the
+  other: such a lock or unlock fails, as does a key change from a
+  `locked`/`unlocked` hook or the `Locker`. Change keys on unlock once the
+  hook has returned.
 
 ### Changed
 
