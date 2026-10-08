@@ -307,13 +307,14 @@ struct Store {
     /// Replaced only when an entry changes, so a reader can tell from this
     /// `Arc` alone whether one did between two snapshots.
     provider: Arc<Vec<ProviderEntry>>,
-    /// Counts the writes that changed a backend key's constraints.
+    /// Counts the writes that changed a backend key's constraints or the
+    /// certificates `ssh-add -s` attached to it.
     generation: u64,
-    /// The generation in which each backend key's constraints last changed,
-    /// by blob, kept after they are gone: a reader that finds a key's
-    /// constraints the same in two snapshots cannot tell from that alone
-    /// whether they changed and changed back in between, as when a key is
-    /// added with `ssh-add -h` and removed again.
+    /// The generation in which each backend key's constraints or attached
+    /// certificates last changed, by blob, kept after they are gone: a
+    /// reader that finds them the same in two snapshots cannot tell from
+    /// that alone whether they changed and changed back in between, as when
+    /// a key is added with `ssh-add -h` and removed again.
     changed: Arc<HashMap<Vec<u8>, u64>>,
     /// The latest generation whose changes to keys with no constraints left
     /// were forgotten, once more than [`REMEMBERED_CHANGES`] of them piled
@@ -501,6 +502,13 @@ impl Store {
         self.provider.iter().find(|e| e.key_blob == key_blob)
     }
 
+    /// The certificates `ssh-add -s` attached to the key `key_blob`, by blob.
+    fn provider_certs(&self, key_blob: &[u8]) -> Vec<&[u8]> {
+        self.provider_entry(key_blob)
+            .map(|e| e.certs.iter().map(|c| c.item.cert.blob()).collect())
+            .unwrap_or_default()
+    }
+
     /// The constraints `ssh-add -s` recorded for the key `key_blob`, if any.
     fn provider_meta(&self, key_blob: &[u8]) -> Option<&KeyMeta> {
         self.provider_entry(key_blob)
@@ -609,10 +617,10 @@ impl Store {
         }
     }
 
-    /// Whether the constraints of the backend key `key_blob` changed at any
-    /// time after `earlier`, a snapshot taken before this one, even if they
-    /// changed back since.
-    fn backend_meta_changed_since(&self, earlier: &Store, key_blob: &[u8]) -> bool {
+    /// Whether the constraints of the backend key `key_blob`, or the
+    /// certificates attached to it, changed at any time after `earlier`, a
+    /// snapshot taken before this one, even if they changed back since.
+    fn backend_key_changed_since(&self, earlier: &Store, key_blob: &[u8]) -> bool {
         let changed = self
             .changed
             .get(key_blob)
@@ -621,8 +629,9 @@ impl Store {
         changed > earlier.generation
     }
 
-    /// Record which backend keys' constraints differ from `previous`, the
-    /// snapshot this one was written from, in a new generation.
+    /// Record which backend keys' constraints or attached certificates
+    /// differ from `previous`, the snapshot this one was written from, in a
+    /// new generation.
     fn record_changes(&mut self, previous: &Store) {
         if Arc::ptr_eq(&self.provider, &previous.provider)
             && Arc::ptr_eq(&self.held, &previous.held)
@@ -637,7 +646,10 @@ impl Store {
         let mut changed: Vec<Vec<u8>> = blobs(previous)
             .into_iter()
             .chain(blobs(self))
-            .filter(|blob| previous.backend_meta(blob) != self.backend_meta(blob))
+            .filter(|blob| {
+                previous.backend_meta(blob) != self.backend_meta(blob)
+                    || previous.provider_certs(blob) != self.provider_certs(blob)
+            })
             .collect();
         if changed.is_empty() {
             return;
@@ -1168,7 +1180,7 @@ impl Agent {
             let after = self.snapshot();
             if consulted
                 .iter()
-                .all(|blob| !after.backend_meta_changed_since(&before, blob))
+                .all(|blob| !after.backend_key_changed_since(&before, blob))
             {
                 return listed
                     .into_iter()
@@ -1187,7 +1199,10 @@ impl Agent {
     /// One pass of [`Self::identities_for`] over `store`, which may be out
     /// of date by the time the backends answer: the identities whose
     /// constraints permit this connection, before the policy is asked. The
-    /// backend keys whose constraints it read go in `consulted`.
+    /// backend keys whose constraints it read go in `consulted`. A
+    /// certificate `ssh-add -s` attached is listed only if its key is among
+    /// those the backends answered with, which a removal may already have
+    /// taken from them while the snapshot still has the certificate.
     fn list_identities(
         &self,
         store: &Store,
@@ -1196,10 +1211,12 @@ impl Agent {
     ) -> Vec<Listing> {
         let mut out = Vec::new();
         self.purge_backends();
+        let mut served = Vec::new();
         for key in self.backends.iter().flat_map(|b| b.identities()) {
             let blob = key.key_blob();
             let meta = store.resolve(Constraints::Provider(blob.clone()));
-            consulted.push(blob);
+            consulted.push(blob.clone());
+            served.push(blob);
             if permitted(&meta, connection) {
                 out.push(Listing {
                     listed: wire::listed(key.public_key()),
@@ -1227,6 +1244,13 @@ impl Agent {
             }
             let (signer, constraints) = identity.signs_with();
             if let Constraints::Provider(blob) = &constraints {
+                if !served.contains(blob) {
+                    tracing::debug!(
+                        key_id = identity.cert.certificate().key_id(),
+                        "certificate's key is not served; not listed"
+                    );
+                    continue;
+                }
                 consulted.push(blob.clone());
             }
             if permitted(&store.resolve(constraints), connection) {
@@ -1977,7 +2001,7 @@ impl Agent {
                 (signer, Constraints::Provider(blob)) => (signer, blob),
             };
             let after = self.snapshot();
-            if !after.backend_meta_changed_since(&before, &blob) {
+            if !after.backend_key_changed_since(&before, &blob) {
                 return Ok((signer, after.backend_meta(&blob)));
             }
             tracing::debug!("key constraints changed during the lookup");
@@ -2016,7 +2040,19 @@ impl Agent {
                 );
                 Err(AgentError::UnknownKey)
             }
-            Some(identity) => Ok(identity.signs_with()),
+            Some(identity) => match identity.signs_with() {
+                (_, Constraints::Provider(blob)) => match self.backend_key(&blob) {
+                    Some(key) => Ok((key, Constraints::Provider(blob))),
+                    None => {
+                        tracing::warn!(
+                            key_id = identity.cert.certificate().key_id(),
+                            "certificate's key is not served"
+                        );
+                        Err(AgentError::UnknownKey)
+                    }
+                },
+                held => Ok(held),
+            },
             None => Err(AgentError::UnknownKey),
         }
     }
@@ -2513,6 +2549,133 @@ mod tests {
         assert_eq!(reply, wire::failure(), "a confirm-constrained key signed");
     }
 
+    /// `ssh-add -s card CERT`, as a request body.
+    fn smartcard_with_cert(cert: &CertKey) -> Vec<u8> {
+        let mut body = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED];
+        b"card".as_slice().encode(&mut body).unwrap();
+        b"".as_slice().encode(&mut body).unwrap();
+        wire::SSH_AGENT_CONSTRAIN_EXTENSION
+            .encode(&mut body)
+            .unwrap();
+        crate::cert::ASSOCIATED_CERTS.encode(&mut body).unwrap();
+        0u8.encode(&mut body).unwrap();
+        let mut blobs = Vec::new();
+        cert.blob().encode(&mut blobs).unwrap();
+        blobs.encode(&mut body).unwrap();
+        body
+    }
+
+    /// A card serving its key with a certificate `ssh-add -s` attached,
+    /// once the card has dropped the key without the agent hearing of it
+    /// yet, as during an `ssh-add -e` between the provider removing the key
+    /// and the agent taking the certificate back.
+    fn dropped_card_with_cert(seed: u8) -> (Agent, CertKey) {
+        let card = Arc::new(Card(Default::default(), ed25519(seed, "card")));
+        let cert = crate::testing::certify(card.1.public_key().key_data());
+        let agent = Agent::new()
+            .with_backend(Arc::clone(&card) as _)
+            .with_smartcard(Arc::clone(&card) as _);
+        assert_eq!(agent.handle(&smartcard_with_cert(&cert)), wire::success());
+        assert!(
+            agent
+                .identities()
+                .iter()
+                .any(|(blob, _)| blob == cert.blob())
+        );
+        assert!(Backend::remove(&card.0, &card.1.key_blob()));
+        (agent, cert)
+    }
+
+    /// A certificate `ssh-add -s` attached is not listed once its key's
+    /// backend has dropped the key, even before the agent hears of it.
+    #[test]
+    fn a_certificate_is_not_listed_once_its_key_is_dropped() {
+        let (agent, cert) = dropped_card_with_cert(0x2a);
+        assert!(
+            !agent
+                .identities()
+                .iter()
+                .any(|(blob, _)| blob == cert.blob()),
+            "a certificate was listed without its key"
+        );
+    }
+
+    /// Nor is it signed with, through the key the agent kept with it.
+    #[test]
+    fn a_certificate_does_not_sign_once_its_key_is_dropped() {
+        let (agent, cert) = dropped_card_with_cert(0x2c);
+        assert_eq!(
+            agent.handle(&sign_body(cert.blob(), b"data")),
+            wire::failure(),
+            "a certificate signed without its key"
+        );
+    }
+
+    /// A certificate taken back with its key, by `ssh-add -e` and then
+    /// `ssh-add -s` without it, while a listing asks the backends, is not
+    /// listed from the snapshot taken before: the key's certificates changed,
+    /// and the listing is taken again.
+    #[test]
+    fn a_certificate_taken_back_midway_is_not_listed() {
+        struct Reattach {
+            card: Card,
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            flickered: std::sync::atomic::AtomicBool,
+        }
+        impl Backend for Reattach {
+            fn identities(&self) -> Vec<SignerRef> {
+                if !self.flickered.swap(true, Ordering::SeqCst) {
+                    let agent = self.agent.get().unwrap().upgrade().unwrap();
+                    let request = |kind: u8| {
+                        let mut body = vec![kind];
+                        b"card".as_slice().encode(&mut body).unwrap();
+                        b"".as_slice().encode(&mut body).unwrap();
+                        body
+                    };
+                    let remove = request(wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY);
+                    assert_eq!(agent.handle(&remove), wire::success());
+                    let add = request(wire::SSH_AGENTC_ADD_SMARTCARD_KEY);
+                    assert_eq!(agent.handle(&add), wire::success());
+                }
+                self.card.identities()
+            }
+        }
+        impl SmartcardProvider for Reattach {
+            fn resolve(&self, p: &[u8], pin: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+                self.card.resolve(p, pin)
+            }
+            fn add(
+                &self,
+                p: &[u8],
+                pin: &Zeroizing<Vec<u8>>,
+                lifetime: Option<u32>,
+            ) -> Result<(), BoxError> {
+                self.card.add(p, pin, lifetime)
+            }
+            fn remove(&self, p: &[u8]) -> Result<crate::Removed, BoxError> {
+                SmartcardProvider::remove(&self.card, p)
+            }
+        }
+
+        let card = Arc::new(Reattach {
+            card: Card(Default::default(), ed25519(0x2b, "card")),
+            agent: std::sync::OnceLock::new(),
+            flickered: std::sync::atomic::AtomicBool::new(true),
+        });
+        let cert = crate::testing::certify(card.card.1.public_key().key_data());
+        let agent = Arc::new(
+            Agent::new()
+                .with_backend(Arc::clone(&card) as _)
+                .with_smartcard(Arc::clone(&card) as _),
+        );
+        let _ = card.agent.set(Arc::downgrade(&agent));
+        assert_eq!(agent.handle(&smartcard_with_cert(&cert)), wire::success());
+
+        card.flickered.store(false, Ordering::SeqCst);
+        let listed = agent.identities();
+        assert_eq!(listed, vec![wire::listed(card.card.1.public_key())]);
+    }
+
     /// The store remembers which keys' constraints changed, keeping only so
     /// many of those whose constraints are gone; a key it forgot counts as
     /// changed. Writes that change no constraints start no generation.
@@ -2539,8 +2702,8 @@ mod tests {
         assert!(after.changed.len() <= REMEMBERED_CHANGES);
         assert!(after.forgotten > before.generation);
         for blob in &blobs {
-            assert!(after.backend_meta_changed_since(&before, blob));
-            assert!(!after.backend_meta_changed_since(&after, blob));
+            assert!(after.backend_key_changed_since(&before, blob));
+            assert!(!after.backend_key_changed_since(&after, blob));
         }
     }
 

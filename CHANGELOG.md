@@ -79,6 +79,14 @@ follows [Semantic Versioning](https://semver.org/).
   turn: call it with none of your own locks held that `known` or a key
   change takes. Called back during a key change it applies at once, as
   before; from a lock or unlock's callbacks it is refused.
+- A certificate attached with `ssh-add -s` could be listed, and signed
+  with through the key the agent kept with it, after its backend had
+  dropped that key, as during `ssh-add -e` or `-D` before the agent took the
+  certificate back; and one taken back while a listing asked the backends
+  could be listed from the snapshot taken before. Such a certificate is now
+  listed only alongside its key in the same listing and signs only with
+  the key a backend still serves, and a listing during which a key's
+  certificates changed is taken again.
 - A `cleared` hook, a backend's `remove`/`remove_all` or a provider's
   `add`/`remove` that locked or unlocked the agent could deadlock with an
   `ssh-add -X` whose `unlocked` hook changed keys, each waiting for the
