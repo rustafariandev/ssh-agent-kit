@@ -38,7 +38,7 @@ use crate::backend::{Backend, Expiring, Lifecycle, SmartcardProvider};
 use crate::cert::{AssociatedCerts, CertKey};
 use crate::destination::{self, Connection, DestinationConstraint};
 use crate::extension::{Extension, ExtensionContext};
-use crate::keytype::{KeyDecoder, KeyRegistry, Registered};
+use crate::keytype::{KeyDecoder, KeyRegistry};
 use crate::lock::{Locker, PassphraseLock};
 use crate::policy::{
     Confirm, ConfirmRequest, KeyChange, KeyConstraints, ListInfo, ManageInfo, Policy, SignInfo,
@@ -124,13 +124,10 @@ pub struct Agent {
     /// publishes the store more than once, so two commits must not
     /// interleave.
     changes: Mutex<()>,
-    /// Protocol extension handlers, by the name each gave when registered,
-    /// replaced as a whole on each registration.
-    extensions: ArcSwap<Vec<(String, Arc<dyn Extension>)>>,
+    /// Protocol extension handlers, by the name each gave when registered.
+    extensions: Vec<(String, Arc<dyn Extension>)>,
     /// Key-type decoders for `ssh-add FILE`, matched by the request's key type.
-    /// A request decodes with its own snapshot of them, so a decoder may call
-    /// back into the agent.
-    key_types: ArcSwap<KeyRegistry>,
+    key_types: KeyRegistry,
     /// Asks the user about keys added with `ssh-add -c`; without one they
     /// never sign.
     confirm: Option<Arc<dyn Confirm>>,
@@ -788,8 +785,8 @@ impl Agent {
             smartcard: None,
             store: ArcSwap::from_pointee(Store::default()),
             changes: Mutex::new(()),
-            extensions: ArcSwap::from_pointee(Vec::new()),
-            key_types: ArcSwap::from_pointee(KeyRegistry::builtin()),
+            extensions: Vec::new(),
+            key_types: KeyRegistry::builtin(),
             confirm: None,
             policy: None,
             lifecycle: Vec::new(),
@@ -852,49 +849,22 @@ impl Agent {
         self
     }
 
-    /// Register a protocol extension handler and return the agent, for the
-    /// builder style of [`Self::new`]. A later registration under the same
-    /// name wins.
-    pub fn with_extension(self, extension: impl Extension + 'static) -> Self {
-        self.register_extension(extension);
-        self
-    }
-
-    /// Register a protocol extension handler, answering
-    /// `SSH_AGENTC_EXTENSION` requests whose name it matches. A later
-    /// registration under the same name wins.
-    pub fn register_extension(&self, extension: impl Extension + 'static) {
-        // Its name is read here, once, not in the `rcu`, which may run again.
+    /// Answer `SSH_AGENTC_EXTENSION` requests whose name `extension` matches.
+    /// A later registration under the same name wins.
+    pub fn with_extension(mut self, extension: impl Extension + 'static) -> Self {
         let name = extension.name().to_owned();
-        let extension: Arc<dyn Extension> = Arc::new(extension);
-        self.extensions.rcu(|current| {
-            let mut extensions = Vec::clone(current);
-            extensions.retain(|(registered, _)| *registered != name);
-            extensions.push((name.clone(), Arc::clone(&extension)));
-            extensions
-        });
-    }
-
-    /// Register a key-type decoder for `ssh-add FILE` and return the agent,
-    /// for the builder style of [`Self::new`]. A later registration under a
-    /// name wins, so a built-in key type can be replaced as well as extended.
-    pub fn with_key_type(self, decoder: impl KeyDecoder + 'static) -> Self {
-        self.register_key_type(decoder);
+        self.extensions
+            .retain(|(registered, _)| *registered != name);
+        self.extensions.push((name, Arc::new(extension)));
         self
     }
 
-    /// Register a key-type decoder, consulted for `SSH2_AGENTC_ADD_IDENTITY`
-    /// requests whose key type it answers. A later registration under a name
-    /// wins.
-    pub fn register_key_type(&self, decoder: impl KeyDecoder + 'static) {
-        // Its key types are read here, once, not in the `rcu`, which may
-        // run again.
-        let decoder = Registered::new(Arc::new(decoder));
-        self.key_types.rcu(|current| {
-            let mut registry = KeyRegistry::clone(current);
-            registry.register_shared(decoder.clone());
-            registry
-        });
+    /// Decode `ssh-add FILE` keys of the types `decoder` answers. A later
+    /// registration under a name wins, so a built-in key type can be
+    /// replaced as well as extended.
+    pub fn with_key_type(mut self, decoder: impl KeyDecoder + 'static) -> Self {
+        self.key_types.register(decoder);
+        self
     }
 
     /// The lifetime keys get without their own `ssh-add -t`.
@@ -1317,7 +1287,7 @@ impl Agent {
     /// bindings a client records with `session-bind@openssh.com` for the life
     /// of its connection.
     pub fn handle_in(&self, body: &[u8], connection: &mut Connection) -> Vec<u8> {
-        let request = wire::parse_request_with(&self.key_types.load_full(), body);
+        let request = wire::parse_request_with(&self.key_types, body);
         let request = match request {
             Ok(request) => request,
             Err(e) => {
@@ -1797,11 +1767,10 @@ impl Agent {
         }
         let extension = self
             .extensions
-            .load()
             .iter()
             .rev()
             .find(|(registered, _)| registered == name)
-            .map(|(_, extension)| Arc::clone(extension));
+            .map(|(_, extension)| extension);
         match extension {
             Some(extension) => {
                 tracing::debug!(extension = %name, "extension request");
@@ -2342,10 +2311,10 @@ pub(crate) mod tests {
         assert_eq!(listed, 0, "a destination-constrained key was listed");
     }
 
-    /// A key decoder may call back into the agent, here to register another
-    /// key type, while it decodes a key.
+    /// A key decoder may call back into the agent, here to list its keys,
+    /// while it decodes a key.
     #[test]
-    fn a_key_decoder_may_register_a_key_type() {
+    fn a_key_decoder_may_call_back_into_the_agent() {
         struct Reentrant(Arc<std::sync::OnceLock<Arc<Agent>>>);
         impl KeyDecoder for Reentrant {
             fn key_types(&self) -> &[&str] {
@@ -2357,7 +2326,7 @@ pub(crate) mod tests {
                 reader: &mut &[u8],
             ) -> Result<SignerRef, crate::KeyDecodeError> {
                 let agent = self.0.get().expect("the agent is set");
-                agent.register_key_type(Reentrant(Arc::clone(&self.0)));
+                agent.handle(&[wire::SSH2_AGENTC_REQUEST_IDENTITIES]);
                 crate::local::decode(key_type, reader).map(SignerRef::new)
             }
         }

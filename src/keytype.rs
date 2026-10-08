@@ -11,7 +11,7 @@
 //! A decoded key is a [`SignerRef`]: anything that can sign, from a private
 //! key held in memory ([`LocalKey`](crate::local::LocalKey)) to a credential
 //! on a device the decoder knows how to reach. Register a decoder with
-//! [`Agent::register_key_type`](crate::Agent::register_key_type).
+//! [`Agent::with_key_type`](crate::Agent::with_key_type).
 
 use crate::local;
 use crate::signer::SignerRef;
@@ -37,7 +37,7 @@ pub enum KeyDecodeError {
 ///
 /// Implementations read the type-specific fields and the trailing comment,
 /// leaving `reader` just past the comment. Register one with
-/// [`Agent::register_key_type`](crate::Agent::register_key_type); a
+/// [`Agent::with_key_type`](crate::Agent::with_key_type); a
 /// later registration under a name wins.
 pub trait KeyDecoder: Send + Sync {
     /// The SSH key type names this decoder answers, e.g. `["ssh-ed25519"]`.
@@ -70,13 +70,13 @@ pub struct KeyRegistry {
 /// A decoder and the key types it answered when registered, read once so
 /// that the registry never calls back into it to match a name.
 #[derive(Clone)]
-pub(crate) struct Registered {
+struct Registered {
     key_types: Vec<String>,
     decoder: Arc<dyn KeyDecoder>,
 }
 
 impl Registered {
-    pub(crate) fn new(decoder: Arc<dyn KeyDecoder>) -> Self {
+    fn new(decoder: Arc<dyn KeyDecoder>) -> Self {
         let key_types = decoder.key_types().iter().map(|t| t.to_string()).collect();
         Registered { key_types, decoder }
     }
@@ -106,13 +106,7 @@ impl KeyRegistry {
     /// can replace a built-in type as well as add a new one. Earlier decoders
     /// left with no name of their own are dropped.
     pub fn register(&mut self, decoder: impl KeyDecoder + 'static) {
-        self.register_shared(Registered::new(Arc::new(decoder)));
-    }
-
-    /// [`Self::register`] for a decoder already shared, with its key types
-    /// read, so a registration can be applied again to a newer copy of the
-    /// registry without calling the decoder.
-    pub(crate) fn register_shared(&mut self, decoder: Registered) {
+        let decoder = Registered::new(Arc::new(decoder));
         self.decoders
             .retain(|d| d.key_types.iter().any(|t| !decoder.key_types.contains(t)));
         self.decoders.push(decoder);

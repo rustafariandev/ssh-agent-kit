@@ -13,8 +13,8 @@ use crate::cert::CertKey;
 use crate::testing::MemoryBackend;
 use crate::{
     Agent, Backend, BoxError, Confirm, ConfirmRequest, Connection, Extension, ExtensionContext,
-    ExtensionReply, KeyDecodeError, KeyDecoder, Lifecycle, ListInfo, Locker, ManageInfo,
-    PassphraseLock, Policy, Removed, SignInfo, SignerRef, SmartcardProvider, wire,
+    ExtensionReply, Lifecycle, ListInfo, Locker, ManageInfo, PassphraseLock, Policy, Removed,
+    SignInfo, SignerRef, SmartcardProvider, wire,
 };
 use ssh_encoding::{Decode, Encode};
 use std::collections::HashMap;
@@ -715,69 +715,6 @@ fn public_mutators_race_with_requests() {
             "a destination-constrained key was listed"
         );
     }));
-    stress(workers);
-}
-
-/// Extensions and key types registered while requests use them.
-#[test]
-fn runtime_registration_under_load() {
-    struct Named(&'static str, Back);
-    impl Extension for Named {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn handle(&self, _: &ExtensionContext, _: &[u8]) -> ExtensionReply {
-            // Call back in, with no lock held.
-            if let Some(agent) = self.1.agent() {
-                agent.handle(&list());
-            }
-            ExtensionReply::Success
-        }
-    }
-    struct Ed25519;
-    impl KeyDecoder for Ed25519 {
-        fn key_types(&self) -> &[&str] {
-            &["ssh-ed25519"]
-        }
-        fn decode(&self, key_type: &str, reader: &mut &[u8]) -> Result<SignerRef, KeyDecodeError> {
-            crate::local::decode(key_type, reader).map(SignerRef::new)
-        }
-    }
-
-    const NAMES: [&str; 3] = ["a@example.com", "b@example.com", "c@example.com"];
-    let agent = Arc::new(Agent::new());
-    let registered = Arc::new(AtomicUsize::new(0));
-
-    let mut workers = Vec::new();
-    {
-        let (agent, registered) = (Arc::clone(&agent), Arc::clone(&registered));
-        workers.push(worker("register", move |step| {
-            let back = Back::default();
-            back.set(&agent);
-            let index = step.rng.below(NAMES.len());
-            step.doing("register extension");
-            agent.register_extension(Named(NAMES[index], back));
-            registered.fetch_or(1 << index, SeqCst);
-            step.doing("register key type");
-            agent.register_key_type(Ed25519);
-        }));
-    }
-    for _ in 0..4 {
-        let (agent, registered) = (Arc::clone(&agent), Arc::clone(&registered));
-        workers.push(worker("use", move |step| {
-            let index = step.rng.below(NAMES.len());
-            let was = registered.load(SeqCst) & (1 << index) != 0;
-            step.doing("extension");
-            let reply = agent.handle(&extension(NAMES[index]));
-            if was {
-                assert_eq!(reply, wire::success(), "a registered extension was lost");
-            }
-            step.doing("add");
-            agent.handle(&add(0x40 + step.rng.below(4) as u8, Limits::default()));
-            step.doing("remove");
-            agent.handle(&remove(&blob(0x40 + step.rng.below(4) as u8)));
-        }));
-    }
     stress(workers);
 }
 
