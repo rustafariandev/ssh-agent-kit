@@ -64,6 +64,13 @@ follows [Semantic Versioning](https://semver.org/).
   accepting connections until it returned. Ticks now run on a thread of
   their own. The ticker holds the handler only while it ticks, so the
   agent and its keys go with their last owner once `serve` returns.
+- A backend key added with `ssh-add -s -h` and removed again while a
+  listing asked the backends could be listed to a connection its constraint
+  hid it from, and one added with `-s -c` signed without a confirm while a
+  sign looked it up: its constraints were the same before and after, so
+  the change went unseen. The agent now records when each key's
+  constraints last changed, and a listing or sign during which they changed
+  at all is taken again.
 - A `cleared` hook, a backend's `remove`/`remove_all` or a provider's
   `add`/`remove` that locked or unlocked the agent could deadlock with an
   `ssh-add -X` whose `unlocked` hook changed keys, each waiting for the

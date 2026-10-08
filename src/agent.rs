@@ -47,6 +47,7 @@ use arc_swap::ArcSwap;
 use ssh_encoding::Decode;
 use ssh_key::{HashAlg, PublicKey};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -166,6 +167,9 @@ const MAX_UNLOCK_FAILURES: u32 = 100;
 /// Times a listing or a sign's key lookup is taken before giving up on
 /// constraints that keep changing under it.
 const LOOKUP_ATTEMPTS: usize = 3;
+/// Backend keys whose constraints are gone that a store still remembers
+/// changing, before it forgets them (see [`Store::changed`]).
+const REMEMBERED_CHANGES: usize = 64;
 
 /// A certificate the agent lists, and the key that signs for it, as found
 /// in a [`Store`].
@@ -289,7 +293,7 @@ enum Constraints {
 /// What the agent holds itself. A published store is never changed: a
 /// write changes a copy (see [`Agent::write`]), so an identity and its
 /// constraints are always seen together. Each collection is shared between
-/// copies until a write changes it, so a copy costs two reference counts.
+/// copies until a write changes it, so a copy costs three reference counts.
 ///
 /// Certificates are kept with the key that signs for them, so a key and
 /// what was attached to it come and go together.
@@ -301,6 +305,18 @@ struct Store {
     /// Replaced only when an entry changes, so a reader can tell from this
     /// `Arc` alone whether one did between two snapshots.
     provider: Arc<Vec<ProviderEntry>>,
+    /// Counts the writes that changed a backend key's constraints.
+    generation: u64,
+    /// The generation in which each backend key's constraints last changed,
+    /// by blob, kept after they are gone: a reader that finds a key's
+    /// constraints the same in two snapshots cannot tell from that alone
+    /// whether they changed and changed back in between, as when a key is
+    /// added with `ssh-add -h` and removed again.
+    changed: Arc<HashMap<Vec<u8>, u64>>,
+    /// The latest generation whose changes to keys with no constraints left
+    /// were forgotten, once more than [`REMEMBERED_CHANGES`] of them piled
+    /// up; such a key counts as changed then.
+    forgotten: u64,
 }
 
 impl Store {
@@ -591,11 +607,58 @@ impl Store {
         }
     }
 
-    /// Whether a backend key's constraints may differ between this snapshot
-    /// and `other`: false only when neither the added keys nor what
-    /// `ssh-add -s` attached were replaced.
-    fn backend_meta_may_differ(&self, other: &Store) -> bool {
-        !(Arc::ptr_eq(&self.provider, &other.provider) && Arc::ptr_eq(&self.held, &other.held))
+    /// Whether the constraints of the backend key `key_blob` changed at any
+    /// time after `earlier`, a snapshot taken before this one, even if they
+    /// changed back since.
+    fn backend_meta_changed_since(&self, earlier: &Store, key_blob: &[u8]) -> bool {
+        let changed = self
+            .changed
+            .get(key_blob)
+            .copied()
+            .unwrap_or(self.forgotten);
+        changed > earlier.generation
+    }
+
+    /// Record which backend keys' constraints differ from `previous`, the
+    /// snapshot this one was written from, in a new generation.
+    fn record_changes(&mut self, previous: &Store) {
+        if Arc::ptr_eq(&self.provider, &previous.provider)
+            && Arc::ptr_eq(&self.held, &previous.held)
+        {
+            return;
+        }
+        let blobs = |store: &Store| -> Vec<Vec<u8>> {
+            let held = store.held.iter().map(|e| e.key.key_blob());
+            held.chain(store.provider.iter().map(|e| e.key_blob.clone()))
+                .collect()
+        };
+        let mut changed: Vec<Vec<u8>> = blobs(previous)
+            .into_iter()
+            .chain(blobs(self))
+            .filter(|blob| previous.backend_meta(blob) != self.backend_meta(blob))
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        changed.sort();
+        changed.dedup();
+        self.generation = previous.generation + 1;
+        let generation = self.generation;
+        let current = blobs(self);
+        let stamps = Arc::make_mut(&mut self.changed);
+        for blob in changed {
+            stamps.insert(blob, generation);
+        }
+        if stamps.len() > REMEMBERED_CHANGES {
+            let forgotten = &mut self.forgotten;
+            stamps.retain(|blob, at| {
+                let keep = current.contains(blob);
+                if !keep {
+                    *forgotten = (*forgotten).max(*at);
+                }
+                keep
+            });
+        }
     }
 
     /// Whether this snapshot and `other` hold the same keys, certificates
@@ -604,8 +667,15 @@ impl Store {
         Arc::ptr_eq(&self.held, &other.held) && Arc::ptr_eq(&self.provider, &other.provider)
     }
 
+    /// Drop every key, certificate and constraint, keeping the record of
+    /// when constraints changed.
     fn clear(&mut self) {
-        *self = Store::default();
+        *self = Store {
+            generation: self.generation,
+            changed: Arc::clone(&self.changed),
+            forgotten: self.forgotten,
+            ..Store::default()
+        };
     }
 }
 
@@ -1015,6 +1085,7 @@ impl Agent {
             let mut next = Store::clone(current);
             next.purge_expired();
             result = Some(change(&mut next));
+            next.record_changes(current);
             next
         });
         result.expect("rcu runs the change at least once")
@@ -1061,10 +1132,9 @@ impl Agent {
             let mut consulted = Vec::new();
             let listed = self.list_identities(&before, connection, &mut consulted);
             let after = self.snapshot();
-            if !before.backend_meta_may_differ(&after)
-                || consulted
-                    .iter()
-                    .all(|blob| before.backend_meta(blob) == after.backend_meta(blob))
+            if consulted
+                .iter()
+                .all(|blob| !after.backend_meta_changed_since(&before, blob))
             {
                 return listed
                     .into_iter()
@@ -1873,9 +1943,8 @@ impl Agent {
                 (signer, Constraints::Provider(blob)) => (signer, blob),
             };
             let after = self.snapshot();
-            let meta = after.backend_meta(&blob);
-            if !before.backend_meta_may_differ(&after) || before.backend_meta(&blob) == meta {
-                return Ok((signer, meta));
+            if !after.backend_meta_changed_since(&before, &blob) {
+                return Ok((signer, after.backend_meta(&blob)));
             }
             tracing::debug!("key constraints changed during the lookup");
         }
@@ -2308,6 +2377,137 @@ mod tests {
             agent.identities_for(&poisoned).is_empty(),
             "a destination-constrained key was listed"
         );
+    }
+
+    /// A smartcard provider, and the backend that lists its one key, whose
+    /// first look-up sends `ssh-add -s` with `constraint` and then `-e`,
+    /// answering with the key as it was served in between: another
+    /// connection's add and removal both landing while a request asks the
+    /// backends. The key's constraints are the same, none, before and after.
+    struct Flicker {
+        keys: crate::testing::MemoryBackend,
+        key: SignerRef,
+        constraint: Vec<u8>,
+        agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+        flickered: std::sync::atomic::AtomicBool,
+    }
+    impl Flicker {
+        fn new(seed: u8, constraint: Vec<u8>) -> Arc<Self> {
+            Arc::new(Flicker {
+                keys: crate::testing::MemoryBackend::default(),
+                key: ed25519(seed, "card"),
+                constraint,
+                agent: std::sync::OnceLock::new(),
+                flickered: Default::default(),
+            })
+        }
+        fn agent(self: &Arc<Self>) -> Arc<Agent> {
+            let agent = Arc::new(
+                Agent::new()
+                    .with_backend(Arc::clone(self) as _)
+                    .with_smartcard(Arc::clone(self) as _),
+            );
+            let _ = self.agent.set(Arc::downgrade(&agent));
+            agent
+        }
+    }
+    impl Backend for Flicker {
+        fn identities(&self) -> Vec<SignerRef> {
+            if self.flickered.swap(true, Ordering::SeqCst) {
+                return self.keys.identities();
+            }
+            let agent = self.agent.get().unwrap().upgrade().unwrap();
+            let request = |kind: u8| {
+                let mut body = vec![kind];
+                b"card".as_slice().encode(&mut body).unwrap();
+                b"".as_slice().encode(&mut body).unwrap();
+                body
+            };
+            let mut add = request(wire::SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED);
+            add.extend_from_slice(&self.constraint);
+            assert_eq!(agent.handle(&add), wire::success());
+            let keys = self.keys.identities();
+            let remove = request(wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY);
+            assert_eq!(agent.handle(&remove), wire::success());
+            keys
+        }
+    }
+    impl SmartcardProvider for Flicker {
+        fn resolve(&self, _: &[u8], _: &Zeroizing<Vec<u8>>) -> Result<SignerRef, BoxError> {
+            Ok(self.key.clone())
+        }
+        fn add(&self, _: &[u8], _: &Zeroizing<Vec<u8>>, _: Option<u32>) -> Result<(), BoxError> {
+            self.keys.0.lock().unwrap().push(self.key.clone());
+            Ok(())
+        }
+        fn remove(&self, _: &[u8]) -> Result<crate::Removed, BoxError> {
+            Ok(crate::Removed {
+                served: Backend::remove(&self.keys, &self.key.key_blob()),
+                key_blob: Some(self.key.key_blob()),
+            })
+        }
+    }
+
+    /// An `ssh-add -s -h` key added and removed while a listing asks the
+    /// backends is not listed, as if unconstrained, to a connection its
+    /// constraint hid it from while it was served: its constraints changed
+    /// and changed back, and the listing is taken again.
+    #[test]
+    fn a_key_hidden_and_gone_midway_is_not_listed() {
+        let card = Flicker::new(0x1e, wire::tests::destination_extension());
+        let agent = card.agent();
+        let mut poisoned = Connection::default();
+        let _ = poisoned.bind(
+            card.key.public_key().clone(),
+            b"sid",
+            b"not a signature",
+            false,
+        );
+        assert!(
+            agent.identities_for(&poisoned).is_empty(),
+            "a destination-constrained key was listed"
+        );
+    }
+
+    /// An `ssh-add -s -c` key added and removed while a sign looks it up
+    /// does not sign, as if unconstrained, without a confirm.
+    #[test]
+    fn a_key_confirmed_and_gone_midway_does_not_sign() {
+        let card = Flicker::new(0x1f, vec![wire::SSH_AGENT_CONSTRAIN_CONFIRM]);
+        let agent = card.agent();
+        let reply = agent.handle(&sign_body(&card.key.key_blob(), b"data"));
+        assert_eq!(reply, wire::failure(), "a confirm-constrained key signed");
+    }
+
+    /// The store remembers which keys' constraints changed, keeping only so
+    /// many of those whose constraints are gone; a key it forgot counts as
+    /// changed. Writes that change no constraints start no generation.
+    #[test]
+    fn forgotten_changes_count_as_changed() {
+        let agent = Agent::new();
+        let before = agent.snapshot();
+        let (plain, _) = local_key(0x01, "plain@example.com");
+        assert_eq!(agent.handle(&plain), wire::success());
+        assert_eq!(agent.snapshot().generation, before.generation);
+
+        let blobs: Vec<Vec<u8>> = (0..=REMEMBERED_CHANGES as u8)
+            .map(|seed| {
+                let (mut add, public) = local_key(0x80 + seed, "hidden@example.com");
+                add[0] = wire::SSH2_AGENTC_ADD_ID_CONSTRAINED;
+                wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+                assert_eq!(agent.handle(&add), wire::success());
+                let blob = public.to_bytes().unwrap();
+                assert!(agent.remove_key(&blob));
+                blob
+            })
+            .collect();
+        let after = agent.snapshot();
+        assert!(after.changed.len() <= REMEMBERED_CHANGES);
+        assert!(after.forgotten > before.generation);
+        for blob in &blobs {
+            assert!(after.backend_meta_changed_since(&before, blob));
+            assert!(!after.backend_meta_changed_since(&after, blob));
+        }
     }
 
     /// Other keys' constraints changing on every pass do not empty a
