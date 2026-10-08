@@ -10,11 +10,13 @@
 //! 1. User code is never called while a lock is held, except the calls that
 //!    must be ordered: a backend's `remove`/`remove_all`, a provider's
 //!    `add`/`remove` and [`Lifecycle::cleared`] during a key change's turn
-//!    (`changes`, see `Agent::prepared_turn`), and the [`Locker`] and the
-//!    `locked`/`unlocked` hooks while the agent is locked or unlocked
-//!    (`lock_state`), so the hooks hear of each in order. Everything else a
-//!    change needs, from key lookups to the policy, runs first, against a
-//!    snapshot. No lock is held through an unlock guess's delay.
+//!    (`changes`, see `Agent::prepared_turn`), and a backend's `known` in
+//!    that turn while [`Agent::release`] checks that a key is gone; and the
+//!    [`Locker`] and the `locked`/`unlocked` hooks while the agent is locked
+//!    or unlocked (`lock_state`), so the hooks hear of each in order.
+//!    Everything else a change needs, from key lookups to the policy, runs
+//!    first, against a snapshot. No lock is held through an unlock guess's
+//!    delay.
 //! 2. The closures given to `Agent::write` and the other `rcu` calls only
 //!    change the value they are given: no I/O, no logging, no user code, no
 //!    nested write. They may run more than once.
@@ -710,6 +712,12 @@ struct Holding {
 }
 
 impl Holding {
+    /// Whether this thread holds `turn` of `agent`.
+    fn holds(agent: &Agent, turn: Turn) -> bool {
+        let agent = std::ptr::from_ref(agent) as usize;
+        HELD.with(|held| held.borrow().contains(&(agent, turn)))
+    }
+
     /// Record `turn` of `agent`, unless this thread holds one of its turns
     /// already: the same one would wait on itself, and the other on any
     /// thread holding it while it waits for the one this thread holds.
@@ -952,7 +960,27 @@ impl Agent {
     /// it and, once something was removed (`served` says whether the key
     /// itself was), its `ssh-add -c`/`-h` constraints. Returns whether any
     /// certificate was dropped.
+    ///
+    /// Waits for any key change in progress, then asks the backends
+    /// ([`Backend::known`]) and does nothing if one serves the key again, as
+    /// it does once `ssh-add -s` re-served it after it was dropped: what
+    /// that add attached stays. Call it with none of your own locks held
+    /// that [`Backend::known`] or a key change's calls take, or it waits
+    /// for itself. Called back during a key change, such as from
+    /// [`Backend::remove`] or [`SmartcardProvider::add`], it applies at
+    /// once, as no other change can land meanwhile; from a lock or unlock's
+    /// callbacks it is refused.
     pub fn release(&self, key_blob: &[u8], served: bool) -> bool {
+        if Holding::holds(self, Turn::Change) {
+            return self.write(|store| store.release(key_blob, served));
+        }
+        let Some(_turn) = self.change_turn() else {
+            return false;
+        };
+        if self.backend_key(key_blob).is_some() {
+            tracing::debug!("not released: a backend serves the key again");
+            return false;
+        }
         self.write(|store| store.release(key_blob, served))
     }
 
@@ -1025,20 +1053,26 @@ impl Agent {
 
     /// Take the turn to commit a key change, waiting for any other
     /// connection's commit. Refused, with an error logged, when this thread
-    /// already holds it, as a callback called during a commit would, since
-    /// waiting would never end; and once the agent is locked, which it may
-    /// have been while this change waited.
+    /// holds one of the agent's turns already, as a callback called during a
+    /// commit or a lock would (see [`Holding`]); and once the agent is
+    /// locked, which it may have been while this change waited.
     fn take_turn(&self) -> Option<ChangeTurn<'_>> {
-        let holding = Holding::enter(self, Turn::Change)?;
-        let turn = ChangeTurn {
-            _changes: lock(&self.changes),
-            _holding: holding,
-        };
+        let turn = self.change_turn()?;
         if self.is_locked() {
             tracing::warn!("refused: the agent is locked");
             return None;
         }
         Some(turn)
+    }
+
+    /// [`Self::take_turn`], locked or not: for a change a backend asks for,
+    /// not a client.
+    fn change_turn(&self) -> Option<ChangeTurn<'_>> {
+        let holding = Holding::enter(self, Turn::Change)?;
+        Some(ChangeTurn {
+            _changes: lock(&self.changes),
+            _holding: holding,
+        })
     }
 
     /// Prepare a key change, then take the turn to commit it. `prepare`
@@ -3799,6 +3833,124 @@ mod tests {
                 .expires
                 .is_some()
         );
+    }
+
+    /// A card that dropped its key, and told the agent only after
+    /// `ssh-add -s -c` served it again, does not take the constraint the
+    /// re-add gave it: the release finds the key served and does nothing.
+    #[test]
+    fn a_late_release_keeps_a_re_served_keys_constraints() {
+        let card = Arc::new(Card(Default::default(), ed25519(0x39, "card")));
+        let agent = Agent::new()
+            .with_backend(Arc::clone(&card) as _)
+            .with_smartcard(Arc::clone(&card) as _);
+        let mut add = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED];
+        b"card".as_slice().encode(&mut add).unwrap();
+        b"".as_slice().encode(&mut add).unwrap();
+        wire::SSH_AGENT_CONSTRAIN_CONFIRM.encode(&mut add).unwrap();
+        let blob = card.1.key_blob();
+        assert_eq!(agent.handle(&add), wire::success());
+
+        assert!(Backend::remove(&card.0, &blob));
+        assert_eq!(agent.handle(&add), wire::success());
+        agent.release(&blob, true);
+        assert_eq!(
+            agent.handle(&sign_body(&blob, b"data")),
+            wire::failure(),
+            "the re-served key lost its constraint"
+        );
+
+        // Once the key is gone, the release takes its constraints.
+        assert!(Backend::remove(&card.0, &blob));
+        agent.release(&blob, true);
+        assert!(agent.snapshot().provider_meta(&blob).is_none());
+    }
+
+    /// A backend asked by a release whether it serves the key, while the
+    /// release holds the key-change turn, may call back into the agent: a
+    /// key change it asks for is refused rather than waiting on the release.
+    #[test]
+    fn a_backend_asked_during_a_release_may_call_back() {
+        struct Reenters {
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            asked: std::sync::atomic::AtomicBool,
+            reply: Mutex<Option<Vec<u8>>>,
+        }
+        impl Backend for Reenters {
+            fn identities(&self) -> Vec<SignerRef> {
+                Vec::new()
+            }
+            fn known(&self) -> Vec<SignerRef> {
+                if !self.asked.swap(true, Ordering::SeqCst) {
+                    let agent = self.agent.get().unwrap().upgrade().unwrap();
+                    let (add, _) = local_key(0x3a, "inner@example.com");
+                    *self.reply.lock().unwrap() = Some(agent.handle(&add));
+                }
+                Vec::new()
+            }
+        }
+
+        let backend = Arc::new(Reenters {
+            agent: std::sync::OnceLock::new(),
+            asked: Default::default(),
+            reply: Mutex::default(),
+        });
+        let agent = Arc::new(Agent::new().with_backend(Arc::clone(&backend) as _));
+        let _ = backend.agent.set(Arc::downgrade(&agent));
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let _ = done.send(agent.release(&ed25519(0x3b, "card").key_blob(), true));
+            });
+        }
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a key change from a release's backend check deadlocked");
+        assert_eq!(*backend.reply.lock().unwrap(), Some(wire::failure()));
+        assert!(agent.public_keys().is_empty());
+    }
+
+    /// A release asked for from an `unlocked` hook is refused rather than
+    /// waiting for a key change: the key keeps its constraints.
+    #[test]
+    fn a_release_from_a_lock_hook_is_refused() {
+        struct Releases {
+            agent: std::sync::OnceLock<std::sync::Weak<Agent>>,
+            blob: Vec<u8>,
+        }
+        impl Lifecycle for Releases {
+            fn unlocked(&self) {
+                let agent = self.agent.get().unwrap().upgrade().unwrap();
+                agent.release(&self.blob, true);
+            }
+        }
+
+        let blob = ed25519(0x3c, "card").key_blob();
+        let hook = Arc::new(Releases {
+            agent: std::sync::OnceLock::new(),
+            blob: blob.clone(),
+        });
+        let agent = Arc::new(Agent::new().with_lifecycle(Arc::clone(&hook) as _));
+        let _ = hook.agent.set(Arc::downgrade(&agent));
+        let confirm = KeyMeta {
+            confirm: true,
+            destination: Vec::new(),
+        };
+        agent.write(|store| store.set_provider_meta(blob.clone(), confirm.clone()));
+        assert!(agent.lock(b"hunter2"));
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let _ = done.send(agent.unlock(b"hunter2"));
+            });
+        }
+        let unlocked = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a release from the unlocked hook deadlocked");
+        assert!(unlocked);
+        assert_eq!(agent.snapshot().provider_meta(&blob), Some(&confirm));
     }
 
     /// A backend's release drops the certificates `ssh-add -s` attached to

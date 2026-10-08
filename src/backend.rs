@@ -27,7 +27,10 @@ use zeroize::Zeroizing;
 /// refused; one made on another thread while holding a lock they take waits
 /// for the commit to finish, so never returns.
 /// [`Agent::release`](crate::Agent::release) and the agent's other methods
-/// may be called. The other methods are called with no lock held.
+/// may be called. [`Self::known`] is also called in that turn by
+/// [`Agent::release`](crate::Agent::release) made on another thread, to
+/// check the key is gone, so call `release` with none of the locks it
+/// takes held. The other methods are called with no lock held.
 pub trait Backend: Send + Sync {
     /// Every identity to list, fetching what is not known yet (which may
     /// mean talking to a device). Keys that cannot be fetched are left out,

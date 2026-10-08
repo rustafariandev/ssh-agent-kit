@@ -71,6 +71,14 @@ follows [Semantic Versioning](https://semver.org/).
   the change went unseen. The agent now records when each key's
   constraints last changed, and a listing or sign during which they changed
   at all is taken again.
+- An `Agent::release` that arrived after `ssh-add -s` had served the
+  dropped key again took the constraints and certificates that add gave it,
+  so an `ssh-add -s -c` key signed without a confirm. A release now waits
+  for any key change in progress and does nothing if a backend serves the
+  key again, which it asks `Backend::known` while holding the key-change
+  turn: call it with none of your own locks held that `known` or a key
+  change takes. Called back during a key change it applies at once, as
+  before; from a lock or unlock's callbacks it is refused.
 - A `cleared` hook, a backend's `remove`/`remove_all` or a provider's
   `add`/`remove` that locked or unlocked the agent could deadlock with an
   `ssh-add -X` whose `unlocked` hook changed keys, each waiting for the
