@@ -2,16 +2,15 @@
 //! keys.
 //!
 //! A certificate is listed as an identity of its own and signs with the key it
-//! certifies, as in OpenSSH's agent. It reaches the agent three ways:
+//! certifies, as in OpenSSH's agent. As there, it reaches the agent only from
+//! `ssh-add`, two ways:
 //!
 //! - `ssh-add FILE` sends the `-cert.pub` next to a private key as an
 //!   `ADD_IDENTITY` whose key type is `<type>-cert-v01@openssh.com` (decoded by
 //!   [`decode_cert_add`]);
 //! - `ssh-add -s IDENTITY CERT…` attaches certificates to a token key through
 //!   the `associated-certs-v00@openssh.com` constraint
-//!   ([`parse_associated_certs`]);
-//! - the agent's owner loads them at startup ([`CertKey::read_file`],
-//!   [`Agent::with_certificates`](crate::Agent::with_certificates)).
+//!   ([`parse_associated_certs`]).
 //!
 //! Every certificate's CA signature is checked when it is loaded, as OpenSSH
 //! does; whether the CA is trusted is for the server to decide.

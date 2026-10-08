@@ -85,6 +85,14 @@ follows [Semantic Versioning](https://semver.org/).
   connections' key changes, and `Policy::allow_manage` may change keys
   itself.
 
+### Removed
+
+- `Agent::with_certificates`. Certificates loaded with the agent had no
+  counterpart in OpenSSH, where every certificate comes from `ssh-add`, and
+  unlike the backend keys they certified they could not be added again
+  once `ssh-add -D` removed them. Add certificates with `ssh-add FILE` or
+  `ssh-add -s PROVIDER CERT…`.
+
 ## [0.1.0] - 2026-10-04
 
 First release, extracted from the agent in

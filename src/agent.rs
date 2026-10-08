@@ -182,9 +182,17 @@ enum CertSigner<'a> {
     /// The key `ssh-add -s PROVIDER CERT…` named; dropped with it, and
     /// constrained as it is.
     Provider(&'a SignerRef),
-    /// Whichever key a backend serves that the certificate certifies, for a
-    /// certificate loaded with [`Agent::with_certificates`].
-    Served,
+}
+
+impl CertIdentity<'_> {
+    /// The key that signs for the certificate, and where the certificate's
+    /// constraints are kept.
+    fn signs_with(&self) -> (SignerRef, Constraints) {
+        match self.signer {
+            CertSigner::Held { key, meta } => (key.clone(), Constraints::Own(meta.clone())),
+            CertSigner::Provider(key) => (key.clone(), Constraints::Provider(key.key_blob())),
+        }
+    }
 }
 
 /// A key `ssh-add FILE` sent: served as an identity of its own, with
@@ -258,14 +266,6 @@ impl ProviderEntry {
     }
 }
 
-/// A certificate [`Agent::with_certificates`] serves for a backend key,
-/// listed under `comment`.
-#[derive(Clone)]
-struct ServedCert {
-    cert: CertKey,
-    comment: String,
-}
-
 /// An identity a listing found, before the policy is asked about it.
 struct Listing {
     listed: wire::Listed,
@@ -286,12 +286,10 @@ enum Constraints {
 /// What the agent holds itself. A published store is never changed: a
 /// write changes a copy (see [`Agent::write`]), so an identity and its
 /// constraints are always seen together. Each collection is shared between
-/// copies until a write changes it, so a copy costs three reference counts.
+/// copies until a write changes it, so a copy costs two reference counts.
 ///
 /// Certificates are kept with the key that signs for them, so a key and
-/// what was attached to it come and go together; only those
-/// [`Agent::with_certificates`] serves, for keys no entry holds, stand
-/// apart.
+/// what was attached to it come and go together.
 #[derive(Clone, Default)]
 struct Store {
     /// Keys added at runtime with `ssh-add FILE`, with their certificates.
@@ -300,8 +298,6 @@ struct Store {
     /// Replaced only when an entry changes, so a reader can tell from this
     /// `Arc` alone whether one did between two snapshots.
     provider: Arc<Vec<ProviderEntry>>,
-    /// Certificates for backend keys, loaded with the agent.
-    served: Arc<Vec<ServedCert>>,
 }
 
 impl Store {
@@ -383,12 +379,7 @@ impl Store {
                     signer: CertSigner::Provider(&e.item.key),
                 })
         });
-        let served = self.served.iter().map(|c| CertIdentity {
-            cert: &c.cert,
-            comment: &c.comment,
-            signer: CertSigner::Served,
-        });
-        held.chain(provider).chain(served)
+        held.chain(provider)
     }
 
     /// The certificate whose blob is `blob`, unless its `ssh-add -t`
@@ -480,10 +471,6 @@ impl Store {
                 .iter_mut()
                 .for_each(|e| e.certs.retain(|c| c.item.cert.blob() != blob));
             provider.retain(|e| !e.is_empty());
-            return true;
-        }
-        if self.served.iter().any(|c| c.cert.blob() == blob) {
-            Arc::make_mut(&mut self.served).retain(|c| c.cert.blob() != blob);
             return true;
         }
         false
@@ -611,9 +598,7 @@ impl Store {
     /// Whether this snapshot and `other` hold the same keys, certificates
     /// and constraints: true only when no collection was replaced.
     fn same_keys(&self, other: &Store) -> bool {
-        Arc::ptr_eq(&self.held, &other.held)
-            && Arc::ptr_eq(&self.provider, &other.provider)
-            && Arc::ptr_eq(&self.served, &other.served)
+        Arc::ptr_eq(&self.held, &other.held) && Arc::ptr_eq(&self.provider, &other.provider)
     }
 
     fn clear(&mut self) {
@@ -863,24 +848,6 @@ impl Agent {
                 });
             }
         }
-    }
-
-    /// Serve certificates for backend keys. Each is listed, under its file's
-    /// comment (else its key id), while a backend serves a key it certifies
-    /// and it has not expired.
-    pub fn with_certificates(self, certs: impl IntoIterator<Item = CertKey>) -> Self {
-        let served: Vec<ServedCert> = certs
-            .into_iter()
-            .map(|cert| {
-                let comment = match cert.comment() {
-                    "" => cert.certificate().key_id().to_owned(),
-                    comment => comment.to_owned(),
-                };
-                ServedCert { cert, comment }
-            })
-            .collect();
-        self.write(|store| Arc::make_mut(&mut store.served).extend(served.iter().cloned()));
-        self
     }
 
     /// Serve the certificate `ssh-add FILE` sent with its private key, with
@@ -1141,9 +1108,7 @@ impl Agent {
                 );
                 continue;
             }
-            let Some((signer, constraints)) = self.cert_signer(&identity) else {
-                continue;
-            };
+            let (signer, constraints) = identity.signs_with();
             if let Constraints::Provider(blob) = &constraints {
                 consulted.push(blob.clone());
             }
@@ -1185,28 +1150,6 @@ impl Agent {
             .filter(|c| c.cert.certifies(key) && !c.cert.expired())
             .map(|c| c.cert.clone())
             .collect()
-    }
-
-    /// The key that signs for a certificate, if it is served, and where the
-    /// certificate's constraints are kept.
-    fn cert_signer(&self, identity: &CertIdentity<'_>) -> Option<(SignerRef, Constraints)> {
-        match identity.signer {
-            CertSigner::Held { key, meta } => {
-                Some(((*key).clone(), Constraints::Own(meta.clone())))
-            }
-            CertSigner::Provider(key) => {
-                Some(((*key).clone(), Constraints::Provider(key.key_blob())))
-            }
-            CertSigner::Served => self
-                .backends
-                .iter()
-                .flat_map(|b| b.known())
-                .find(|key| identity.cert.certifies(key.public_key()))
-                .map(|key| {
-                    let blob = key.key_blob();
-                    (key, Constraints::Provider(blob))
-                }),
-        }
     }
 
     /// The backend key whose public key blob is `key_blob`, if it is known.
@@ -1732,15 +1675,11 @@ impl Agent {
     }
 
     /// The constraints of the identity whose blob is `key_blob`, served or
-    /// not: a key `ssh-add -s` added keeps them before it is served. Only a
-    /// certificate [`Self::with_certificates`] serves asks the backends.
+    /// not: a key `ssh-add -s` added keeps them before it is served.
     fn constraints_of(&self, store: &Store, key_blob: &[u8]) -> KeyMeta {
         let constraints = if let Some((_, meta)) = store.held_key(key_blob) {
             Constraints::Own(meta.clone())
-        } else if let Some((_, constraints)) = store
-            .cert(key_blob)
-            .and_then(|identity| self.cert_signer(&identity))
-        {
+        } else if let Some((_, constraints)) = store.cert(key_blob).map(|i| i.signs_with()) {
             constraints
         } else {
             Constraints::Provider(key_blob.to_vec())
@@ -1961,7 +1900,7 @@ impl Agent {
                 );
                 Err(AgentError::UnknownKey)
             }
-            Some(identity) => self.cert_signer(&identity).ok_or(AgentError::UnknownKey),
+            Some(identity) => Ok(identity.signs_with()),
             None => Err(AgentError::UnknownKey),
         }
     }
