@@ -86,7 +86,9 @@ follows [Semantic Versioning](https://semver.org/).
   could be listed from the snapshot taken before. Such a certificate is now
   listed only alongside its key in the same listing and signs only with
   the key a backend still serves, and a listing during which a key's
-  certificates changed is taken again.
+  certificates changed is taken again. Certificates `ssh-add -C -s` adds
+  to a key no backend serves are still served on their own, as in
+  OpenSSH, until `ssh-add -e` takes them back.
 - A `cleared` hook, a backend's `remove`/`remove_all` or a provider's
   `add`/`remove` that locked or unlocked the agent could deadlock with an
   `ssh-add -X` whose `unlocked` hook changed keys, each waiting for the

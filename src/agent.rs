@@ -182,6 +182,9 @@ struct CertIdentity<'a> {
     /// `None` for `ssh-add -s`, whose certificates are constrained as their
     /// key is.
     own: Option<&'a KeyMeta>,
+    /// Whether `ssh-add -C -s` added it to a key no backend served, so it
+    /// is served without its key, signing with `key`.
+    alone: bool,
 }
 
 impl CertIdentity<'_> {
@@ -249,6 +252,9 @@ struct ProviderEntry {
 struct ProviderCert {
     cert: CertKey,
     key: SignerRef,
+    /// Added with `ssh-add -C -s` while no backend served `key`: served on
+    /// its own, as in OpenSSH, rather than only beside its key.
+    alone: bool,
 }
 
 impl ProviderEntry {
@@ -394,6 +400,7 @@ impl Store {
                     comment: &e.item.comment,
                     key: &entry.key,
                     own: Some(&e.item.meta),
+                    alone: false,
                 })
         });
         let provider = self.provider.iter().flat_map(|entry| {
@@ -406,6 +413,7 @@ impl Store {
                     comment: e.item.key.comment(),
                     key: &e.item.key,
                     own: None,
+                    alone: e.item.alone,
                 })
         });
         held.chain(provider)
@@ -532,8 +540,15 @@ impl Store {
     }
 
     /// Serve `certs` for the `ssh-add -s` key `key`, under its constraints,
-    /// replacing each wherever it is served.
-    fn attach_provider_certs(&mut self, key: &SignerRef, certs: &[CertKey], lifetime: Option<u32>) {
+    /// replacing each wherever it is served. `alone` serves them without
+    /// their key (see [`ProviderCert::alone`]).
+    fn attach_provider_certs(
+        &mut self,
+        key: &SignerRef,
+        certs: &[CertKey],
+        lifetime: Option<u32>,
+        alone: bool,
+    ) {
         for cert in certs {
             self.take_cert(cert.blob());
         }
@@ -542,6 +557,7 @@ impl Store {
                 ProviderCert {
                     cert: cert.clone(),
                     key: key.clone(),
+                    alone,
                 },
                 lifetime,
             )
@@ -1166,7 +1182,8 @@ impl Agent {
     /// backend keys whose constraints it read go in `consulted`. A
     /// certificate `ssh-add -s` attached is listed only if its key is among
     /// those the backends answered with, which a removal may already have
-    /// taken from them while the snapshot still has the certificate.
+    /// taken from them while the snapshot still has the certificate, unless
+    /// `ssh-add -C -s` added it to serve without its key.
     fn list_identities(
         &self,
         store: &Store,
@@ -1208,7 +1225,7 @@ impl Agent {
             }
             let constraints = identity.constraints();
             if let Constraints::Provider(blob) = &constraints {
-                if !served.contains(blob) {
+                if !identity.alone && !served.contains(blob) {
                     tracing::debug!(
                         key_id = identity.cert.certificate().key_id(),
                         "certificate's key is not served; not listed"
@@ -1658,7 +1675,7 @@ impl Agent {
             if !meta.is_empty() && store.provider_meta(&blob) != Some(&meta) {
                 return false;
             }
-            store.attach_provider_certs(&key, &matching, lifetime);
+            store.attach_provider_certs(&key, &matching, lifetime, certs_only && !served);
             true
         });
         drop(turn);
@@ -2025,6 +2042,9 @@ impl Agent {
             Some(identity) => match identity.constraints() {
                 Constraints::Provider(blob) => match self.backend_key(&blob) {
                     Some(key) => Ok((key, Constraints::Provider(blob))),
+                    None if identity.alone => {
+                        Ok((identity.key.clone(), Constraints::Provider(blob)))
+                    }
                     None => {
                         tracing::warn!(
                             key_id = identity.cert.certificate().key_id(),
@@ -2570,6 +2590,11 @@ pub(crate) mod tests {
 
     /// `ssh-add -s card CERT`, as a request body.
     fn smartcard_with_cert(cert: &CertKey) -> Vec<u8> {
+        smartcard_certs(cert, false)
+    }
+
+    /// `ssh-add [-C] -s card CERT`, as a request body.
+    fn smartcard_certs(cert: &CertKey, certs_only: bool) -> Vec<u8> {
         let mut body = vec![wire::SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED];
         b"card".as_slice().encode(&mut body).unwrap();
         b"".as_slice().encode(&mut body).unwrap();
@@ -2577,7 +2602,7 @@ pub(crate) mod tests {
             .encode(&mut body)
             .unwrap();
         crate::cert::ASSOCIATED_CERTS.encode(&mut body).unwrap();
-        0u8.encode(&mut body).unwrap();
+        u8::from(certs_only).encode(&mut body).unwrap();
         let mut blobs = Vec::new();
         cert.blob().encode(&mut blobs).unwrap();
         blobs.encode(&mut body).unwrap();
@@ -2627,6 +2652,40 @@ pub(crate) mod tests {
             agent.handle(&sign_body(cert.blob(), b"data")),
             wire::failure(),
             "a certificate signed without its key"
+        );
+    }
+
+    /// `ssh-add -C -s` serves a certificate without its key, as in
+    /// OpenSSH: it is listed and signs though no backend serves the key,
+    /// and `ssh-add -e` takes it back.
+    #[test]
+    fn certificates_alone_are_served_without_their_key() {
+        let card = Arc::new(Card(Default::default(), ed25519(0x2e, "card")));
+        let cert = crate::testing::certify(card.1.public_key().key_data());
+        let agent = Agent::new()
+            .with_backend(Arc::clone(&card) as _)
+            .with_smartcard(Arc::clone(&card) as _);
+        assert_eq!(agent.handle(&smartcard_certs(&cert, true)), wire::success());
+        let listed: Vec<_> = agent.identities().into_iter().map(|(b, _)| b).collect();
+        assert_eq!(listed, vec![cert.blob().to_vec()]);
+        assert_eq!(
+            agent.handle(&sign_body(cert.blob(), b"data"))[0],
+            wire::SSH2_AGENT_SIGN_RESPONSE
+        );
+        assert_eq!(
+            agent.handle(&sign_body(&card.1.key_blob(), b"data")),
+            wire::failure(),
+            "the key signed without being served"
+        );
+
+        let mut remove = vec![wire::SSH_AGENTC_REMOVE_SMARTCARD_KEY];
+        b"card".as_slice().encode(&mut remove).unwrap();
+        b"".as_slice().encode(&mut remove).unwrap();
+        assert_eq!(agent.handle(&remove), wire::success());
+        assert!(agent.identities().is_empty());
+        assert_eq!(
+            agent.handle(&sign_body(cert.blob(), b"data")),
+            wire::failure()
         );
     }
 
@@ -4148,7 +4207,7 @@ pub(crate) mod tests {
         };
         agent.write(|store| {
             store.set_provider_meta(key.key_blob(), confirm.clone());
-            store.attach_provider_certs(&key, std::slice::from_ref(&cert), None);
+            store.attach_provider_certs(&key, std::slice::from_ref(&cert), None, false);
         });
         let before = agent.snapshot();
         assert!(agent.release(&key.key_blob(), true));
