@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-10
+
 ### Fixed
 
 - An `ssh-add -c`/`-h` key could lose its constraints, and sign without
@@ -154,4 +156,6 @@ First release, extracted from the agent in
   `derived-card`, `policy-agent`, `extension-agent`, `idle-agent` and
   `in-process`.
 
+[Unreleased]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/rustafariandev/ssh-agent-kit/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/rustafariandev/ssh-agent-kit/releases/tag/v0.1.0
