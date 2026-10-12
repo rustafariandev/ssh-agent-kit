@@ -4871,4 +4871,66 @@ pub(crate) mod tests {
         assert_eq!(named.0.load(Ordering::SeqCst), 1);
         assert_eq!(typed.load(Ordering::SeqCst), 1);
     }
+
+    struct Ping;
+
+    impl Extension for Ping {
+        fn name(&self) -> &str {
+            "ping@example.com"
+        }
+
+        fn handle(&self, ctx: &ExtensionContext, data: &[u8]) -> crate::ExtensionReply {
+            use crate::ExtensionReply;
+            match (ctx.locked(), data) {
+                (false, b"ping") => ExtensionReply::Success,
+                (true, b"ping") => ExtensionReply::Failure,
+                (_, b"raw") => ExtensionReply::Raw(vec![42, 1, 2]),
+                _ => ExtensionReply::ExtensionFailure,
+            }
+        }
+    }
+
+    struct PingOverride;
+
+    impl Extension for PingOverride {
+        fn name(&self) -> &str {
+            "ping@example.com"
+        }
+
+        fn handle(&self, _ctx: &ExtensionContext, _data: &[u8]) -> crate::ExtensionReply {
+            crate::ExtensionReply::Raw(vec![7])
+        }
+    }
+
+    #[test]
+    fn registered_extensions_answer_by_name() {
+        let agent = Agent::new().with_extension(Ping);
+
+        let ext = |name: &str, data: &[u8]| {
+            let mut body = vec![wire::SSH_AGENTC_EXTENSION];
+            name.encode(&mut body).unwrap();
+            body.extend_from_slice(data);
+            agent.handle(&body)
+        };
+
+        assert_eq!(ext("ping@example.com", b"ping"), wire::success());
+        assert_eq!(ext("ping@example.com", b"raw"), vec![42, 1, 2]);
+        assert_eq!(ext("ping@example.com", b"nope"), wire::extension_failure());
+        // An unknown name still gets the extension-failure code.
+        assert_eq!(ext("other@example.com", b""), wire::extension_failure());
+
+        // The handler decides what to do while the agent is locked.
+        assert!(agent.lock(b"hunter2"));
+        assert_eq!(ext("ping@example.com", b"ping"), wire::failure());
+    }
+
+    #[test]
+    fn last_extension_registered_under_a_name_wins() {
+        let agent = Agent::new()
+            .with_extension(Ping)
+            .with_extension(PingOverride);
+        let mut body = vec![wire::SSH_AGENTC_EXTENSION];
+        "ping@example.com".encode(&mut body).unwrap();
+        assert_eq!(agent.handle(&body), vec![7]);
+    }
 }
