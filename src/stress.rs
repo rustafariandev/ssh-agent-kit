@@ -578,7 +578,7 @@ fn mixed_churn_never_hangs() {
                 }
                 2 | 3 => {
                     step.doing("remove");
-                    remove(step.rng.pick(&blobs))
+                    remove(step.rng.pick(&blobs).as_slice())
                 }
                 4 => {
                     step.doing("remove all");
@@ -586,7 +586,7 @@ fn mixed_churn_never_hangs() {
                 }
                 5..=7 => {
                     step.doing("sign");
-                    sign(step.rng.pick(&blobs))
+                    sign(step.rng.pick(&blobs).as_slice())
                 }
                 8 => {
                     step.doing("list");
@@ -1079,7 +1079,7 @@ fn confirm_keys_never_sign_unconfirmed() {
             let (op, body) = match step.rng.below(5) {
                 0 => ("remove all", remove_all()),
                 1 | 2 => ("remove smartcard", smartcard_remove(card)),
-                _ => ("remove", remove(step.rng.pick(&blobs))),
+                _ => ("remove", remove(step.rng.pick(&blobs).as_slice())),
             };
             step.doing(op);
             agent.handle(&body);
@@ -1147,7 +1147,7 @@ fn hidden_keys_stay_hidden() {
             let (op, body) = match step.rng.below(4) {
                 0 => ("remove all", remove_all()),
                 1 => ("remove smartcard", smartcard_remove("card")),
-                _ => ("remove", remove(step.rng.pick(&hidden))),
+                _ => ("remove", remove(step.rng.pick(&hidden).as_slice())),
             };
             step.doing(op);
             agent.handle(&body);
@@ -1253,7 +1253,7 @@ fn lock_hooks_alternate() {
         .map(|_| {
             let agent = Arc::clone(&agent);
             worker("lock", move |step| {
-                let passphrase: &[u8] = step.rng.pick(&[b"pw".as_slice(), b"other"]);
+                let passphrase: &[u8] = step.rng.pick::<&[u8]>(&[b"pw".as_slice(), b"other"]);
                 match step.rng.below(4) {
                     0 => {
                         step.doing("lock request");
@@ -2066,7 +2066,7 @@ fn a_blocked_callback_holds_up_only_its_own_request() {
             let limits = *step.rng.pick(&[Limits::default(), HIDDEN]);
             let (op, body) = match step.rng.below(7) {
                 0 | 1 => ("add", add(*step.rng.pick(&others), limits)),
-                2 => ("remove", remove(step.rng.pick(&removable))),
+                2 => ("remove", remove(step.rng.pick(&removable).as_slice())),
                 3 => ("remove all", remove_all()),
                 4 => ("add smartcard", smartcard("card", limits, &[])),
                 5 => ("remove smartcard", smartcard_remove("card")),
@@ -2082,7 +2082,7 @@ fn a_blocked_callback_holds_up_only_its_own_request() {
             step.doing("list");
             agent.handle(&list());
             step.doing("sign");
-            agent.handle(&sign(step.rng.pick(&signable)));
+            agent.handle(&sign(step.rng.pick(&signable).as_slice()));
             step.doing("identities");
             agent.identities();
         }));
@@ -2117,7 +2117,7 @@ fn a_blocked_callback_holds_up_only_its_own_request() {
             step.doing("list");
             agent.handle(&list());
             step.doing("sign");
-            agent.handle(&sign(step.rng.pick(&signable)));
+            agent.handle(&sign(step.rng.pick(&signable).as_slice()));
             step.doing("certificates_for");
             agent.certificates_for(&local_key(0x16, "stress").1);
         }));
@@ -2423,9 +2423,9 @@ fn every_callback_may_call_back_into_the_agent() {
             let card = *step.rng.pick(&["card", "other"]);
             let (op, body) = match step.rng.below(12) {
                 0 | 1 => ("add", add(seed, limits)),
-                2 => ("remove", remove(step.rng.pick(&blobs))),
+                2 => ("remove", remove(step.rng.pick(&blobs).as_slice())),
                 3 => ("remove all", remove_all()),
-                4 | 5 => ("sign", sign(step.rng.pick(&blobs))),
+                4 | 5 => ("sign", sign(step.rng.pick(&blobs).as_slice())),
                 6 => ("list", list()),
                 7 => ("lock", lock(b"pw")),
                 8 => ("unlock", unlock(b"pw")),
