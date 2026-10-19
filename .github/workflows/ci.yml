@@ -39,13 +39,12 @@ jobs:
         run: |
           ssh -V
           command -v ssh-add ssh-agent ssh-keygen
-      # On Windows, Windows' own OpenSSH, whose ssh-add speaks named pipes.
+      # On Windows, Win32-OpenSSH, whose ssh-add speaks named pipes:
+      # installed if the runner lacks it.
       - name: Windows OpenSSH
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          & "$env:SystemRoot\System32\OpenSSH\ssh-add.exe" -V
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+        run: ./.github/scripts/windows-openssh.ps1
       - name: Test
         run: cargo test --features dsa
         env:
@@ -76,6 +75,10 @@ jobs:
           toolchain: "1.88"
       - name: Check
         run: cargo check --all-targets --features dsa,test-util
+      - name: Windows OpenSSH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/windows-openssh.ps1
       - name: Test
         run: cargo test --features dsa
         env:
