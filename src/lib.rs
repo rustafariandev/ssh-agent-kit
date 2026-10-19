@@ -15,10 +15,16 @@
 //! | answer `SSH_AGENTC_EXTENSION` names   | [`Extension`]                  | [`Agent::with_extension`]      |
 //! | hear lock, unlock and `ssh-add -D`    | [`Lifecycle`]                  | [`Agent::with_lifecycle`]      |
 //! | keep the lock elsewhere               | [`Locker`]                     | [`Agent::with_locker`]         |
-//! | serve over something other than a unix socket | [`Listener`] + [`Stream`] | [`serve`]                  |
+//! | serve over another transport (vsock, …) | [`Listener`] + [`Stream`] | [`serve`]                  |
 //!
 //! Private keys sent with `ssh-add FILE` (ed25519, RSA, ECDSA and, with the
 //! `dsa` feature, DSA) are held in memory out of the box.
+//!
+//! [`bind_socket`] makes an owner-only unix socket, or on Windows a named
+//! pipe (`\\.\pipe\NAME`) that Win32-OpenSSH reaches through
+//! `SSH_AUTH_SOCK`. On Windows the crate also answers PuTTY's tools as
+//! Pageant would: serve the pipe `pageant_pipe_name()` names, and open
+//! Pageant's window with `serve_pageant_window`.
 //!
 //! ```no_run
 //! use ssh_agent_kit::{Agent, bind_socket, default_socket_path, serve};
@@ -45,6 +51,10 @@ pub mod extension;
 pub mod keytype;
 pub mod local;
 pub mod lock;
+#[cfg(windows)]
+mod pageant;
+#[cfg(windows)]
+mod pipe;
 pub mod policy;
 pub mod server;
 pub mod signer;
@@ -52,11 +62,14 @@ pub mod signer;
 mod stress;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
+#[cfg(unix)]
+mod unix;
 pub mod wire;
 
 pub use agent::{Agent, AgentError};
 pub use backend::{Backend, Expiring, Lifecycle, Removed, SmartcardProvider};
 pub use cert::{AssociatedCerts, CertError, CertKey};
+pub use client::{ClientStream, connect};
 pub use destination::{
     BindError, Connection, ConstraintError, ConstraintHop, DestinationConstraint, HostKeySpec,
     SessionBinding, Userauth,
@@ -69,12 +82,16 @@ pub use local::{
     EcdsaLocalKey, Ed25519LocalKey, LocalKey, LocalKeyError, LocalKeyRef, RsaLocalKey,
 };
 pub use lock::{Locker, PassphraseLock};
+#[cfg(windows)]
+pub use pageant::{pageant_pipe_name, serve_pageant_window};
+#[cfg(windows)]
+pub use pipe::{PeerUser, PipeListener, PipeStream};
 pub use policy::{
     Confirm, ConfirmRequest, KeyChange, KeyConstraints, ListInfo, ManageInfo, Policy, SignInfo,
 };
 pub use server::{
-    Handler, Listener, SocketError, SocketGuard, Stream, bind_socket, default_socket_path,
-    ephemeral_socket_path, handle_connection, serve,
+    Handler, Listener, SocketError, SocketGuard, SocketListener, Stream, bind_socket,
+    default_socket_path, ephemeral_socket_path, handle_connection, serve,
 };
 pub use signer::{BoxError, Signer, SignerRef, VerifyError, verify};
 pub use ssh_key;

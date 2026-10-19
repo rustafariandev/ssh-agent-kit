@@ -14,9 +14,10 @@
 //! ```
 
 use ssh_agent_kit::wire::{self, read_frame, write_frame};
-use ssh_agent_kit::{Agent, Extension, ExtensionContext, ExtensionReply, bind_socket, serve};
+use ssh_agent_kit::{
+    Agent, Extension, ExtensionContext, ExtensionReply, bind_socket, connect, serve,
+};
 use ssh_encoding::{Decode, Encode};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,7 +56,7 @@ impl Extension for Status {
 
 /// Send one extension request and print the reply.
 fn ask(socket: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = connect(socket)?;
     let mut request = vec![wire::SSH_AGENTC_EXTENSION];
     STATUS.encode(&mut request)?;
     write_frame(&mut stream, &request)?;

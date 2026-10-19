@@ -166,15 +166,24 @@ impl CertKey {
     }
 }
 
-/// `blob` with validity times past `i64::MAX` lowered to it, or `None` if
-/// none are (or the blob does not get that far).
+/// The latest validity time `ssh-key` parses: `i64::MAX` seconds, or on
+/// Windows, whose `SystemTime` ends in the year 30828, its last second.
+pub(crate) const MAX_VALIDITY: u64 = if cfg!(windows) {
+    910_692_730_085
+} else {
+    i64::MAX as u64
+};
+
+/// `blob` with validity times past [`MAX_VALIDITY`] lowered to it, or `None`
+/// if none are (or the blob does not get that far).
 ///
 /// `ssh-keygen -s` without `-V` writes a certificate valid forever, whose
-/// `valid_before` is `2^64 - 1`; `ssh-key` 0.6.7 refuses any time above
-/// `i64::MAX`. The parse uses the lowered copy, which changes nothing in
-/// practice, while the CA signature is still checked over the original.
+/// `valid_before` is `2^64 - 1`; `ssh-key` 0.6.7 refuses any time it cannot
+/// hold as a `SystemTime`. The parse uses the lowered copy, which changes
+/// nothing in practice, while the CA signature is still checked over the
+/// original.
 fn clamp_validity(blob: &[u8]) -> Option<Vec<u8>> {
-    const MAX: u64 = i64::MAX as u64;
+    const MAX: u64 = MAX_VALIDITY;
     let mut r = blob;
     let base = Algorithm::new_certificate(&String::decode(&mut r).ok()?).ok()?;
     Vec::<u8>::decode(&mut r).ok()?; // nonce
@@ -386,6 +395,24 @@ pub(crate) mod tests {
             CertKey::from_blob(&blob[..blob.len() - 1]),
             Err(CertError::Malformed)
         ));
+    }
+
+    /// Validity times are lowered to the latest this platform's
+    /// `SystemTime` holds, which is earlier on Windows.
+    #[test]
+    fn the_validity_limit_is_the_latest_system_time() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert!(
+            UNIX_EPOCH
+                .checked_add(Duration::from_secs(MAX_VALIDITY))
+                .is_some()
+        );
+        #[cfg(windows)]
+        assert!(
+            UNIX_EPOCH
+                .checked_add(Duration::from_secs(MAX_VALIDITY + 1))
+                .is_none()
+        );
     }
 
     #[test]

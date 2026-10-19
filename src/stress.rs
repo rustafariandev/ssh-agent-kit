@@ -954,10 +954,9 @@ fn a_slow_locker_does_not_stall_requests() {
 #[test]
 fn server_churn_with_ticker() {
     use std::io::Write;
-    use std::os::unix::net::UnixStream;
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("agent.sock");
+    let path = crate::server::test_socket_path(dir.path());
     let (listener, guard) = crate::bind_socket(&path).unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let agent = Arc::new(Agent::new());
@@ -975,7 +974,7 @@ fn server_churn_with_ticker() {
         let (path, answered) = (path.clone(), Arc::clone(&answered));
         workers.push(worker("client", move |step| {
             step.doing("connect");
-            let Ok(mut stream) = UnixStream::connect(&path) else {
+            let Ok(mut stream) = crate::connect(&path) else {
                 return;
             };
             // Longer than the watchdog, so a hang is reported as one.
@@ -1008,7 +1007,12 @@ fn server_churn_with_ticker() {
                 match wire::read_frame(&mut stream) {
                     Ok(Some(_)) => answered.fetch_add(1, SeqCst),
                     Ok(None) => return,
-                    Err(wire::FrameError::Io(e)) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                    Err(wire::FrameError::Io(e))
+                        if !matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
                         return;
                     }
                     Err(e) => panic!("{op}: {e}"),
@@ -1020,7 +1024,7 @@ fn server_churn_with_ticker() {
     workers.push(worker("hoard", move |step| {
         step.doing("hoard connections");
         let held: Vec<_> = (0..140)
-            .filter_map(|_| UnixStream::connect(&hoard_path).ok())
+            .filter_map(|_| crate::connect(&hoard_path).ok())
             .collect();
         step.rng.pause(20_000);
         drop(held);
@@ -1032,7 +1036,7 @@ fn server_churn_with_ticker() {
     within("a request after the churn", {
         let path = path.clone();
         move || {
-            let mut stream = UnixStream::connect(&path).unwrap();
+            let mut stream = crate::connect(&path).unwrap();
             wire::write_frame(&mut stream, &list()).unwrap();
             wire::read_frame(&mut stream).unwrap().unwrap()
         }

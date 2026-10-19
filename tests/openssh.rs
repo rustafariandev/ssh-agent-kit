@@ -1,22 +1,84 @@
-//! The kit's agent driven by OpenSSH's own tools over a real socket.
+//! The kit's agent driven by OpenSSH's own tools over a real socket, or on
+//! Windows a named pipe and Win32-OpenSSH's tools.
 
-use ssh_agent_kit::{Agent, bind_socket, serve, wire};
+use ssh_agent_kit::{Agent, ClientStream, bind_socket, connect, serve, wire};
 use ssh_encoding::Encode;
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-fn have(tool: &str) -> bool {
-    Command::new(tool)
+/// The OpenSSH tool `name`. On Windows, Win32-OpenSSH's (from
+/// `$SSH_AGENT_KIT_OPENSSH`, else where Windows installs it), not whatever
+/// comes first on `PATH`: the `ssh-add` Git for Windows bundles cannot
+/// reach an agent on a named pipe.
+fn tool(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let dir = std::env::var_os("SSH_AGENT_KIT_OPENSSH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+                Path::new(&root).join(r"System32\OpenSSH")
+            });
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.exists() {
+            return exe;
+        }
+    }
+    PathBuf::from(name)
+}
+
+fn have(name: &str) -> bool {
+    let found = Command::new(tool(name))
         .arg("-V")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok()
+        .is_ok();
+    // CI must not pass by skipping everything.
+    if !found && std::env::var_os("CI").is_some() {
+        panic!("{name} not found");
+    }
+    found
+}
+
+/// Where a test agent listens: `agent.sock` in `dir`, or on Windows a pipe
+/// name no other test uses.
+fn socket_in(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        PathBuf::from(format!(
+            r"\\.\pipe\ssh-agent-kit-openssh-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+    #[cfg(unix)]
+    dir.join("agent.sock")
+}
+
+/// An askpass program in `dir` that answers `passphrase`: a shell script, or
+/// on Windows a batch file.
+fn askpass_program(dir: &Path, passphrase: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let script = dir.join("askpass.cmd");
+        std::fs::write(&script, format!("@echo {passphrase}\r\n")).unwrap();
+        script
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("askpass.sh");
+        std::fs::write(&script, format!("#!/bin/sh\necho '{passphrase}'\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
 }
 
 /// An agent serving on a socket in a temporary directory.
@@ -30,7 +92,7 @@ struct Harness {
 impl Harness {
     fn start(agent: Agent) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("agent.sock");
+        let socket = socket_in(dir.path());
         let (listener, guard) = bind_socket(&socket).unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = {
@@ -50,8 +112,8 @@ impl Harness {
 
     /// Run `tool` against this agent only: `SSH_AUTH_SOCK` is always set,
     /// so the user's own agent is never touched.
-    fn run(&self, tool: &str, args: &[&str]) -> Output {
-        Command::new(tool)
+    fn run(&self, program: &str, args: &[&str]) -> Output {
+        Command::new(tool(program))
             .args(args)
             .env("SSH_AUTH_SOCK", &self.socket)
             .env_remove("SSH_AGENT_PID")
@@ -64,7 +126,7 @@ impl Harness {
 
     /// `program` pointed at this agent, for tests that set more up.
     fn cmd(&self, program: &str) -> Command {
-        let mut c = Command::new(program);
+        let mut c = Command::new(tool(program));
         c.env("SSH_AUTH_SOCK", &self.socket)
             .env_remove("SSH_AGENT_PID");
         c
@@ -72,7 +134,7 @@ impl Harness {
 
     fn keygen(&self, name: &str, kind: &str) -> PathBuf {
         let path = self.dir.path().join(name);
-        let out = Command::new("ssh-keygen")
+        let out = Command::new(tool("ssh-keygen"))
             .args(["-q", "-t", kind, "-N", "", "-C", name, "-f"])
             .arg(&path)
             .output()
@@ -129,7 +191,7 @@ fn openssh_tools_drive_the_agent() {
     let signers = agent.dir.path().join("allowed_signers");
     let line = std::fs::read_to_string(&public).unwrap();
     std::fs::write(&signers, format!("ferris {line}")).unwrap();
-    let out = Command::new("ssh-keygen")
+    let out = Command::new(tool("ssh-keygen"))
         .args(["-Y", "verify", "-n", "file", "-I", "ferris", "-f"])
         .arg(&signers)
         .args(["-s", &format!("{}.sig", text(&message))])
@@ -145,15 +207,9 @@ fn openssh_tools_drive_the_agent() {
 
     // Locked: nothing listed until unlocked. ssh-add reads the passphrase
     // from SSH_ASKPASS when there is no terminal.
-    let askpass = agent.dir.path().join("askpass");
-    std::fs::write(&askpass, "#!/bin/sh\necho hunter2\n").unwrap();
-    std::fs::set_permissions(
-        &askpass,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .unwrap();
+    let askpass = askpass_program(agent.dir.path(), "hunter2");
     let with_askpass = |args: &[&str]| {
-        Command::new("ssh-add")
+        Command::new(tool("ssh-add"))
             .args(args)
             .env("SSH_AUTH_SOCK", &agent.socket)
             .env("SSH_ASKPASS", &askpass)
@@ -211,7 +267,7 @@ fn empty_agent_starts_keyless_and_accepts_added_keys() {
 
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("id_ed25519");
-    let generated = Command::new("ssh-keygen")
+    let generated = Command::new(tool("ssh-keygen"))
         .args(["-t", "ed25519", "-N", "", "-C", "keyless@example.com", "-f"])
         .arg(&key_path)
         .stdout(Stdio::null())
@@ -249,7 +305,7 @@ fn ssh_add_loads_a_regular_rsa_key() {
         let name = format!("regular-rsa{bits}");
         let comment = format!("{name}@example.com");
         let key_path = dir.path().join(&name);
-        let generated = Command::new("ssh-keygen")
+        let generated = Command::new(tool("ssh-keygen"))
             .args(["-t", "rsa", "-b", bits, "-N", "", "-C", &comment, "-f"])
             .arg(&key_path)
             .stdout(Stdio::null())
@@ -297,7 +353,7 @@ fn ssh_add_loads_a_regular_ecdsa_key() {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join(format!("id_ecdsa_{bits}"));
         let comment = format!("regular-{name}@example.com");
-        let generated = Command::new("ssh-keygen")
+        let generated = Command::new(tool("ssh-keygen"))
             .args([
                 "-t",
                 "ecdsa",
@@ -353,7 +409,7 @@ fn ssh_add_loads_a_regular_dsa_key() {
     let h = Harness::start(Agent::new());
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("id_dsa");
-    let generated = Command::new("ssh-keygen")
+    let generated = Command::new(tool("ssh-keygen"))
         .args(["-t", "dsa", "-N", "", "-C", "regular-dsa@example.com", "-f"])
         .arg(&key_path)
         .stdout(Stdio::null())
@@ -393,7 +449,7 @@ fn sign_and_check(h: &Harness, dir: &Path, pub_line: &str, name: &str) {
     let sig_path = dir.join(format!("{name}.msg.sig"));
     assert!(sig_path.exists());
 
-    let mut check = Command::new("ssh-keygen")
+    let mut check = Command::new(tool("ssh-keygen"))
         .args(["-Y", "check-novalidate", "-n", "kit-test", "-f"])
         .arg(&pub_path)
         .arg("-s")
@@ -418,7 +474,7 @@ fn sign_and_check(h: &Harness, dir: &Path, pub_line: &str, name: &str) {
 }
 
 fn roundtrip(socket: &Path, body: &[u8]) -> Vec<u8> {
-    let mut stream = UnixStream::connect(socket).unwrap();
+    let mut stream = connect(socket).unwrap();
     wire::write_frame(&mut stream, body).unwrap();
     wire::read_frame(&mut stream).unwrap().unwrap()
 }
@@ -445,7 +501,7 @@ fn unsupported_and_unknown_key_requests_get_failure_and_keep_connection() {
     b"data".as_slice().encode(&mut body).unwrap();
     0u32.encode(&mut body).unwrap();
     // Two requests on one connection: failure must not close it.
-    let mut stream = UnixStream::connect(&h.socket).unwrap();
+    let mut stream = connect(&h.socket).unwrap();
     wire::write_frame(&mut stream, &body).unwrap();
     assert_eq!(
         wire::read_frame(&mut stream).unwrap().unwrap(),
@@ -463,14 +519,14 @@ fn unsupported_and_unknown_key_requests_get_failure_and_keep_connection() {
 fn certify_valid(dir: &Path, pub_path: &Path, validity: &str) -> String {
     let ca = dir.join("ca");
     if !ca.exists() {
-        let made = Command::new("ssh-keygen")
+        let made = Command::new(tool("ssh-keygen"))
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "ca", "-f"])
             .arg(&ca)
             .status()
             .unwrap();
         assert!(made.success(), "ssh-keygen (CA) failed");
     }
-    let signed = Command::new("ssh-keygen")
+    let signed = Command::new(tool("ssh-keygen"))
         .args(["-q", "-s"])
         .arg(&ca)
         .args(["-I", "kit-test", "-n", "ferris", "-V", validity])
@@ -514,7 +570,7 @@ fn ssh_add_loads_a_key_with_its_certificate() {
         ("ecdsa", Some("384"), "-5m:+1h"),
     ] {
         let key_path = dir.path().join(format!("id_{kind}"));
-        let mut keygen = Command::new("ssh-keygen");
+        let mut keygen = Command::new(tool("ssh-keygen"));
         keygen.args(["-q", "-t", kind, "-N", "", "-C", "cert@example.com"]);
         if let Some(bits) = bits {
             keygen.args(["-b", bits]);
@@ -549,13 +605,18 @@ fn ssh_add_loads_a_key_with_its_certificate() {
 
         // ssh-add exits 1 after `-C` even with OpenSSH's agent, since the
         // plain key it skipped counts as not added; the listing tells.
-        h.cmd("ssh-add")
+        let out = h
+            .cmd("ssh-add")
             .arg("-C")
             .arg(&key_path)
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .unwrap();
+        // Older ssh-add, such as Windows' 9.5, has no `-C`.
+        if String::from_utf8_lossy(&out.stderr).contains("unknown option") {
+            eprintln!("ssh-add has no -C; skipping that part");
+            continue;
+        }
         let lines = listing(&h);
         assert_eq!(lines.len(), 1, "{kind}: {lines:?}");
         assert!(lines[0].contains("-cert-v01@openssh.com "));
@@ -565,17 +626,22 @@ fn ssh_add_loads_a_key_with_its_certificate() {
 
 /// A real OpenSSH `ssh-agent` on a private socket, so the same commands can be
 /// run against it and against the kit's agent and the observable results compared.
+///
+/// Unix only: Windows' `ssh-agent` runs as a service on its one pipe, and
+/// cannot be started as a user on another.
+#[cfg(unix)]
 struct ReferenceAgent {
     socket: std::path::PathBuf,
     child: std::process::Child,
     _dir: tempfile::TempDir,
 }
 
+#[cfg(unix)]
 impl ReferenceAgent {
     fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("agent.sock");
-        let child = Command::new("ssh-agent")
+        let child = Command::new(tool("ssh-agent"))
             .arg("-D")
             .arg("-a")
             .arg(&socket)
@@ -597,12 +663,13 @@ impl ReferenceAgent {
     }
 
     fn cmd(&self, program: &str) -> Command {
-        let mut c = Command::new(program);
+        let mut c = Command::new(tool(program));
         c.env("SSH_AUTH_SOCK", &self.socket);
         c
     }
 }
 
+#[cfg(unix)]
 impl Drop for ReferenceAgent {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -612,10 +679,9 @@ impl Drop for ReferenceAgent {
 
 /// Run `ssh-add` with `flag` against `cmd`'s agent, answering the prompt with
 /// `passphrase` through SSH_ASKPASS. Returns whether it succeeded.
+#[cfg(unix)]
 fn askpass(cmd: &mut Command, dir: &Path, flag: &str, passphrase: &str) -> bool {
-    let script = dir.join("askpass.sh");
-    std::fs::write(&script, format!("#!/bin/sh\necho '{passphrase}'\n")).unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let script = askpass_program(dir, passphrase);
     cmd.arg(flag)
         .env("SSH_ASKPASS", &script)
         .env("SSH_ASKPASS_REQUIRE", "force")
@@ -629,6 +695,7 @@ fn askpass(cmd: &mut Command, dir: &Path, flag: &str, passphrase: &str) -> bool 
 }
 
 /// Run `ssh-add -l` against either agent, returning its exit status and stdout.
+#[cfg(unix)]
 fn list_output(mut cmd: Command) -> (bool, String) {
     let out = cmd.arg("-l").output().unwrap();
     (out.status.success(), String::from_utf8(out.stdout).unwrap())
@@ -638,6 +705,7 @@ fn list_output(mut cmd: Command) -> (bool, String) {
 /// from a real OpenSSH `ssh-agent`: an empty list, loading a plain key,
 /// listing it, removing it, clearing everything and locking the agent.
 #[test]
+#[cfg(unix)]
 fn matches_openssh_agent_for_common_operations() {
     if !have("ssh-agent") || !have("ssh-add") || !have("ssh-keygen") {
         eprintln!("OpenSSH tools not installed; skipping");
@@ -652,7 +720,7 @@ fn matches_openssh_agent_for_common_operations() {
 
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("id_ed25519");
-    let generated = Command::new("ssh-keygen")
+    let generated = Command::new(tool("ssh-keygen"))
         .args(["-t", "ed25519", "-N", "", "-C", "diff@example.com", "-f"])
         .arg(&key_path)
         .stdout(Stdio::null())
@@ -728,6 +796,7 @@ fn matches_openssh_agent_for_common_operations() {
 }
 
 /// `ssh-add FILE` against a command that already names its agent.
+#[cfg(unix)]
 fn ssh_add_file_cmd(mut cmd: Command, path: &Path) -> bool {
     cmd.arg(path)
         .stdin(Stdio::null())
@@ -739,6 +808,7 @@ fn ssh_add_file_cmd(mut cmd: Command, path: &Path) -> bool {
 }
 
 /// The authorized_keys lines from `ssh-add -L`, which ssh-add prints itself.
+#[cfg(unix)]
 fn signing_lines(mut cmd: Command) -> String {
     let out = cmd.arg("-L").output().unwrap();
     String::from_utf8(out.stdout).unwrap()
@@ -848,7 +918,7 @@ fn session_bind_is_verified_and_query_lists_it() {
     let mut signature_bytes = Vec::new();
     signature.encode(&mut signature_bytes).unwrap();
 
-    let mut stream = UnixStream::connect(&h.socket).unwrap();
+    let mut stream = connect(&h.socket).unwrap();
     let bind = session_bind_body(&hostkey, session_id, &signature_bytes, false);
     wire::write_frame(&mut stream, &bind).unwrap();
     assert_eq!(
@@ -864,7 +934,7 @@ fn session_bind_is_verified_and_query_lists_it() {
     );
 
     // A bad signature is refused.
-    let mut bad = UnixStream::connect(&h.socket).unwrap();
+    let mut bad = connect(&h.socket).unwrap();
     let tampered = session_bind_body(&hostkey, session_id, b"not a signature", false);
     wire::write_frame(&mut bad, &tampered).unwrap();
     assert_eq!(
@@ -922,7 +992,7 @@ fn destination_constrained_key_signs_only_on_its_bound_host() {
     );
 
     // On a connection bound to the permitted host, the signature is served.
-    let mut stream = UnixStream::connect(&h.socket).unwrap();
+    let mut stream = connect(&h.socket).unwrap();
     let bind = session_bind_body(&hostkey, session_id, &signature_bytes, false);
     wire::write_frame(&mut stream, &bind).unwrap();
     assert_eq!(
@@ -943,7 +1013,7 @@ fn destination_constrained_key_signs_only_on_its_bound_host() {
 }
 
 /// Send one request on an open connection and read its reply.
-fn exchange(stream: &mut UnixStream, body: &[u8]) -> Vec<u8> {
+fn exchange(stream: &mut ClientStream, body: &[u8]) -> Vec<u8> {
     wire::write_frame(stream, body).unwrap();
     wire::read_frame(stream).unwrap().unwrap()
 }
@@ -954,15 +1024,15 @@ fn exchange(stream: &mut UnixStream, body: &[u8]) -> Vec<u8> {
 fn connections_beyond_the_limit_are_closed() {
     let h = Harness::start(Agent::new());
     let list = [wire::SSH2_AGENTC_REQUEST_IDENTITIES];
-    let mut open: Vec<UnixStream> = (0..128)
+    let mut open: Vec<ClientStream> = (0..128)
         .map(|_| {
-            let mut stream = UnixStream::connect(&h.socket).unwrap();
+            let mut stream = connect(&h.socket).unwrap();
             exchange(&mut stream, &list);
             stream
         })
         .collect();
 
-    let mut extra = UnixStream::connect(&h.socket).unwrap();
+    let mut extra = connect(&h.socket).unwrap();
     let _ = wire::write_frame(&mut extra, &list);
     assert!(!matches!(wire::read_frame(&mut extra), Ok(Some(_))));
 
@@ -970,7 +1040,7 @@ fn connections_beyond_the_limit_are_closed() {
     drop(open.pop());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let mut stream = UnixStream::connect(&h.socket).unwrap();
+        let mut stream = connect(&h.socket).unwrap();
         let _ = wire::write_frame(&mut stream, &list);
         if let Ok(Some(reply)) = wire::read_frame(&mut stream) {
             assert_eq!(reply[0], wire::SSH2_AGENT_IDENTITIES_ANSWER);
@@ -984,6 +1054,7 @@ fn connections_beyond_the_limit_are_closed() {
 /// For every key type `ssh-add FILE` accepts, the kit's agent lists and serves the
 /// same key as OpenSSH's own agent.
 #[test]
+#[cfg(unix)]
 fn matches_openssh_agent_listing_for_each_key_type() {
     if !have("ssh-agent") || !have("ssh-add") || !have("ssh-keygen") {
         eprintln!("OpenSSH tools not installed; skipping");
@@ -1001,7 +1072,7 @@ fn matches_openssh_agent_listing_for_each_key_type() {
     ];
     for (name, args) in cases {
         let key_path = dir.path().join(name);
-        let generated = Command::new("ssh-keygen")
+        let generated = Command::new(tool("ssh-keygen"))
             .args(*args)
             .args(["-N", "", "-C", name, "-f"])
             .arg(&key_path)

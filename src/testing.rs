@@ -26,7 +26,7 @@ pub fn certify_until(key: &KeyData, valid_before: u64) -> CertKey {
 
 /// A certificate for `key` that never expires; see [`certify_until`].
 pub fn certify(key: &KeyData) -> CertKey {
-    certify_until(key, u64::MAX >> 1)
+    certify_until(key, crate::cert::MAX_VALIDITY)
 }
 
 /// The `ADD_IDENTITY` body ssh-add sends for a certificate: the blob, the

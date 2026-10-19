@@ -6,6 +6,31 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-18
+
+### Added
+
+- Windows support. `bind_socket` makes a named pipe (`\\.\pipe\NAME`) that
+  Win32-OpenSSH's `ssh`, `ssh-add` and `ssh-keygen` reach through
+  `SSH_AUTH_SOCK`. The pipe is owned by the user, and only the user and
+  LocalSystem may open it. Clients running as anyone else are refused, and
+  so is a pipe name that is already taken. `default_socket_path` and
+  `ephemeral_socket_path` give pipe names there.
+- Pageant compatibility on Windows, for PuTTY and the tools built on it:
+  `pageant_pipe_name` names the pipe newer ones connect to, and
+  `serve_pageant_window` answers older ones' `WM_COPYDATA` requests.
+- `connect` and `ClientStream`, a client connection to an agent on either
+  platform. On Windows it waits out a busy pipe, and refuses a pipe served
+  by another user.
+- `SocketListener`, what `bind_socket` returns: `UnixListener`, or
+  `PipeListener` on Windows.
+
+### Fixed
+
+- On Windows, certificates valid "forever" (what `ssh-keygen -s` writes
+  without `-V`) were refused. Their validity is now lowered to the latest
+  time Windows can hold, as it already was to `i64::MAX` elsewhere.
+
 ## [1.0.1] - 2026-10-18
 
 ### Fixed
@@ -163,7 +188,8 @@ First release, extracted from the agent in
   `derived-card`, `policy-agent`, `extension-agent`, `idle-agent` and
   `in-process`.
 
-[Unreleased]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/rustafariandev/ssh-agent-kit/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/rustafariandev/ssh-agent-kit/releases/tag/v0.1.0
