@@ -12,7 +12,9 @@ where keys come from and what is allowed. Out of the box it supports:
   destination constraints, with `session-bind@openssh.com`;
 - OpenSSH certificates, from `ssh-add`, `ssh-add -s PROVIDER CERT…` or files;
 - `ssh-add -x`/`-X` locking, with OpenSSH's back-off on wrong passphrases;
-- an owner-only unix socket, peer uid checks and a cap on connections.
+- an owner-only unix socket, or named pipe on Windows, with peer user
+  checks and a cap on connections;
+- on Windows, Pageant's pipe and window, for PuTTY and the tools built on it.
 
 ## Extension points
 
@@ -26,7 +28,7 @@ where keys come from and what is allowed. Out of the box it supports:
 | answer `SSH_AGENTC_EXTENSION` requests         | `Extension`                  | `Agent::with_extension` |
 | hear lock, unlock and `ssh-add -D`             | `Lifecycle`                  | `Agent::with_lifecycle` |
 | keep the lock state elsewhere                  | `Locker`                     | `Agent::with_locker`    |
-| serve over something other than a unix socket  | `Listener` + `Stream`        | `serve`                 |
+| serve over another transport (vsock, …)        | `Listener` + `Stream`        | `serve`                 |
 | wrap the agent in your own type                | `Handler`                    | `serve`                 |
 
 The agent never blocks on a slow key. The crate is synchronous and the
@@ -72,6 +74,42 @@ transport.
 
 [okagent](https://github.com/rustafariandev/onlykey-rs) is a full agent built
 on this crate. It serves OnlyKey hardware keys and FIDO security keys.
+
+## Platforms
+
+On Linux, macOS and the BSDs the agent listens on a unix socket.
+`bind_socket` creates it owner-only in a directory other users cannot
+write to, and refuses connections from processes run by other users (root
+excepted).
+
+On Windows it listens on a named pipe instead. Win32-OpenSSH (the `ssh`,
+`ssh-add` and `ssh-keygen` that ship with Windows) connects to the pipe
+`SSH_AUTH_SOCK` names:
+
+```powershell
+cargo run --example file-agent -- \.\pipe\file-agent
+$env:SSH_AUTH_SOCK = '\.\pipe\file-agent'   # in another window
+ssh-add $HOME\.ssh\id_ed25519
+```
+
+The pipe is owned by you and only you and LocalSystem may open it. A
+client's process must run as you or as LocalSystem. A pipe name that is
+already taken, whether by a live agent or by another user posing as one,
+is refused rather than shared.
+
+PuTTY, plink, WinSCP and other tools built on PuTTY's code look for
+Pageant rather than `SSH_AUTH_SOCK`, and the crate can answer them as
+well. Newer ones connect to the pipe that `pageant_pipe_name()` names;
+serve it like any other pipe. Older ones send `WM_COPYDATA` to a hidden
+"Pageant" window, which `serve_pageant_window` opens. `file-agent` serves
+all three ways.
+
+Git for Windows bundles its own `ssh`, which cannot reach an agent on a
+named pipe. Point Git at Windows' OpenSSH instead:
+
+```powershell
+git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe
+```
 
 ## Features
 

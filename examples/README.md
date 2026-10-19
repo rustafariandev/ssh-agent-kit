@@ -12,11 +12,23 @@ socket with `SSH_AUTH_SOCK=SOCKET`.
 | [`policy-agent`](policy-agent.rs) | A `Policy`: allow logins and chosen `ssh-keygen -Y sign` namespaces only; refuse forwarded logins and key changes | `policy-agent SOCKET [NAMESPACE…]` |
 | [`extension-agent`](extension-agent.rs) | An `Extension` that answers `status@example.com`, and a client that asks for it | `extension-agent serve SOCKET` / `ask SOCKET` |
 | [`idle-agent`](idle-agent.rs) | A `Handler` wrapper that forgets keys after an idle time, and a `Lifecycle` hook that logs lock/unlock/clear | `idle-agent SOCKET SECONDS` |
-| [`in-process`](in-process.rs) | A custom `Listener`: an agent served over in-memory connections, driven by raw protocol messages; checks itself | `in-process` |
+| [`in-process`](in-process.rs) | A custom `Listener`: an agent served over in-memory connections, driven by raw protocol messages; checks itself (Unix only) | `in-process` |
 
 Use a socket path short enough for a unix socket (about 100 bytes), in a
 directory only you can write to: `bind_socket` refuses one that other users
 can write to.
+
+On Windows, `SOCKET` is a named pipe such as `\\.\pipe\card`, and
+Windows' own OpenSSH is the client:
+
+```powershell
+cargo run --example derived-card -- \\.\pipe\card
+$env:SSH_AUTH_SOCK = '\\.\pipe\card'   # in another window
+ssh-add -s github
+ssh-add -L
+```
+
+`file-agent` on Windows also answers PuTTY's tools, as Pageant would.
 
 A quick session with one of them:
 

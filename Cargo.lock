@@ -752,6 +752,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "windows-sys",
  "zeroize",
 ]
 

@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -32,14 +32,26 @@ jobs:
         run: cargo fmt -- --check
       - name: Clippy
         run: cargo clippy --all-targets --features dsa,test-util -- -D warnings
+      # The OpenSSH tests use Windows' own OpenSSH, whose ssh-add speaks
+      # named pipes; fail here, plainly, if the runner lacks it.
+      - name: Windows OpenSSH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:SystemRoot\System32\OpenSSH\ssh-add.exe" -V
+          if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Test
         run: cargo test --features dsa
         env:
           RUSTFLAGS: ""
 
   msrv:
-    name: minimum Rust version
-    runs-on: ubuntu-latest
+    name: minimum Rust version (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

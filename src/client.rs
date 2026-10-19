@@ -3,9 +3,28 @@
 
 use crate::wire;
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+/// A connection to an agent: a unix socket, or a named pipe on Windows.
+#[cfg(unix)]
+pub type ClientStream = std::os::unix::net::UnixStream;
+/// A connection to an agent: a unix socket, or a named pipe on Windows.
+#[cfg(windows)]
+pub type ClientStream = crate::pipe::PipeStream;
+
+/// Connect to the agent listening at `socket`, as `SSH_AUTH_SOCK` names it.
+///
+/// On Windows `socket` is a pipe name (`\.\pipe\…`). A busy pipe is waited
+/// for, and the pipe must be served by this user or by LocalSystem (as
+/// Windows' own `ssh-agent` service is), so another user cannot pose as the
+/// agent and collect the keys sent to it.
+pub fn connect(socket: &Path) -> io::Result<ClientStream> {
+    #[cfg(unix)]
+    return ClientStream::connect(socket);
+    #[cfg(windows)]
+    return crate::pipe::connect(socket);
+}
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -24,7 +43,7 @@ pub enum ClientError {
 /// Add a key with `SSH2_AGENTC_ADD_IDENTITY`. `body` is what follows the
 /// message type: the key type, the key and its comment.
 pub fn add_identity(socket: &Path, body: &[u8]) -> Result<(), ClientError> {
-    let mut stream = UnixStream::connect(socket).map_err(|source| ClientError::Connect {
+    let mut stream = connect(socket).map_err(|source| ClientError::Connect {
         path: socket.to_owned(),
         source,
     })?;
@@ -52,7 +71,7 @@ mod tests {
     #[test]
     fn adds_a_key_to_a_running_agent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.sock");
+        let path = crate::server::test_socket_path(dir.path());
         let (listener, _guard) = bind_socket(&path).unwrap();
         let agent = Arc::new(Agent::new());
         let shutdown = Arc::new(AtomicBool::new(false));

@@ -8,6 +8,16 @@
 //! ssh-add ~/.ssh/id_ed25519
 //! ssh-add -l
 //! ```
+//!
+//! On Windows the socket is a named pipe, and the agent also answers
+//! PuTTY's tools as Pageant would, on Pageant's pipe and window:
+//!
+//! ```powershell
+//! cargo run --example file-agent -- \.\pipe\file-agent
+//! $env:SSH_AUTH_SOCK = '\.\pipe\file-agent'   # in another window
+//! ssh-add $HOME\.ssh\id_ed25519
+//! ssh-add -l
+//! ```
 
 use ssh_agent_kit::{
     Agent, Confirm, ConfirmRequest, Policy, SignInfo, bind_socket, default_socket_path, serve,
@@ -49,10 +59,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| default_socket_path("file-agent"));
     let (listener, _guard) = bind_socket(&path)?;
-    let agent = Agent::new()
-        .with_confirm(Arc::new(AskOnStdin))
-        .with_policy(Arc::new(Audit));
+    let agent = Arc::new(
+        Agent::new()
+            .with_confirm(Arc::new(AskOnStdin))
+            .with_policy(Arc::new(Audit)),
+    );
+    let shutdown = Arc::new(AtomicBool::new(false));
+    #[cfg(windows)]
+    {
+        eprintln!("$env:SSH_AUTH_SOCK = '{}'", path.display());
+        serve_as_pageant(&agent, &shutdown);
+    }
+    #[cfg(unix)]
     eprintln!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK", path.display());
-    serve(listener, Arc::new(agent), Arc::new(AtomicBool::new(false)))?;
+    serve(listener, agent, shutdown)?;
     Ok(())
+}
+
+/// Answer PuTTY's tools too, on threads of their own: newer ones on
+/// Pageant's pipe, older ones through its window. Either is skipped, with a
+/// warning, when a Pageant already has it.
+#[cfg(windows)]
+fn serve_as_pageant(agent: &Arc<Agent>, shutdown: &Arc<AtomicBool>) {
+    use ssh_agent_kit::{pageant_pipe_name, serve_pageant_window};
+
+    let pipe = pageant_pipe_name()
+        .map_err(|e| e.to_string())
+        .and_then(|name| bind_socket(&name).map_err(|e| e.to_string()));
+    match pipe {
+        Ok((listener, guard)) => {
+            let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+            std::thread::spawn(move || {
+                let _guard = guard;
+                if let Err(e) = serve(listener, agent, shutdown) {
+                    eprintln!("Pageant pipe: {e}");
+                }
+            });
+        }
+        Err(e) => eprintln!("not serving Pageant's pipe: {e}"),
+    }
+    let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+    std::thread::spawn(move || {
+        if let Err(e) = serve_pageant_window(agent, shutdown) {
+            eprintln!("not serving Pageant's window: {e}");
+        }
+    });
 }
