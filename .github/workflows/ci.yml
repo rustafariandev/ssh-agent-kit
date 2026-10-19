@@ -32,8 +32,14 @@ jobs:
         run: cargo fmt -- --check
       - name: Clippy
         run: cargo clippy --all-targets --features dsa,test-util -- -D warnings
-      # The OpenSSH tests use Windows' own OpenSSH, whose ssh-add speaks
-      # named pipes; fail here, plainly, if the runner lacks it.
+      # The OpenSSH tests fail rather than skip in CI when a tool is
+      # missing; say up front which OpenSSH they will drive.
+      - name: OpenSSH
+        if: runner.os != 'Windows'
+        run: |
+          ssh -V
+          command -v ssh-add ssh-agent ssh-keygen
+      # On Windows, Windows' own OpenSSH, whose ssh-add speaks named pipes.
       - name: Windows OpenSSH
         if: runner.os == 'Windows'
         shell: pwsh
@@ -42,6 +48,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Test
         run: cargo test --features dsa
+        env:
+          RUSTFLAGS: ""
+          # Longer than the default 750 ms, so races have time to show.
+          # A failure prints the STRESS_SEED that reproduces it.
+          STRESS_MS: "5000"
+      # The example asserts its own results; it needs UnixStream::pair.
+      - name: Self-checking example
+        if: runner.os != 'Windows'
+        run: cargo run --example in-process
         env:
           RUSTFLAGS: ""
 
@@ -61,6 +76,10 @@ jobs:
           toolchain: "1.88"
       - name: Check
         run: cargo check --all-targets --features dsa,test-util
+      - name: Test
+        run: cargo test --features dsa
+        env:
+          RUSTFLAGS: ""
 
   package:
     name: package

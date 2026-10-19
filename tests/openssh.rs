@@ -38,8 +38,8 @@ fn have(name: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok();
-    // Windows CI must not pass by skipping everything.
-    if !found && cfg!(windows) && std::env::var_os("CI").is_some() {
+    // CI must not pass by skipping everything.
+    if !found && std::env::var_os("CI").is_some() {
         panic!("{name} not found");
     }
     found
