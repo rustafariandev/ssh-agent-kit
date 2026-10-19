@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-18
+
 ### Added
 
 - Windows support. `bind_socket` makes a named pipe (`\\.\pipe\NAME`) that
@@ -186,7 +188,8 @@ First release, extracted from the agent in
   `derived-card`, `policy-agent`, `extension-agent`, `idle-agent` and
   `in-process`.
 
-[Unreleased]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/rustafariandev/ssh-agent-kit/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/rustafariandev/ssh-agent-kit/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/rustafariandev/ssh-agent-kit/releases/tag/v0.1.0
