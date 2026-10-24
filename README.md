@@ -14,7 +14,9 @@ where keys come from and what is allowed. Out of the box it supports:
 - `ssh-add -x`/`-X` locking, with OpenSSH's back-off on wrong passphrases;
 - an owner-only unix socket, or named pipe on Windows, with peer user
   checks and a cap on connections;
-- on Windows, Pageant's pipe and window, for PuTTY and the tools built on it.
+- on Windows, Pageant's pipe and window, for PuTTY and the tools built on it,
+  and a Cygwin-style socket for the `ssh` in Git for Windows, MSYS2 and
+  Cygwin.
 
 ## Extension points
 
@@ -104,8 +106,20 @@ serve it like any other pipe. Older ones send `WM_COPYDATA` to a hidden
 "Pageant" window, which `serve_pageant_window` opens. `file-agent` serves
 all three ways.
 
-Git for Windows bundles its own `ssh`, which cannot reach an agent on a
-named pipe. Point Git at Windows' OpenSSH instead:
+The `ssh` and `ssh-add` that Git for Windows, MSYS2 and Cygwin bundle
+cannot open a named pipe. They connect to a Cygwin-style socket: a file
+naming a loopback port and a secret, which `bind_cygwin_socket` creates.
+Only you and LocalSystem may read the file. Clients that don't know the
+secret, or whose process runs as another user, are refused. Serve it
+alongside the pipe, and point Git Bash at it with forward slashes:
+
+```sh
+export SSH_AUTH_SOCK=C:/Users/me/AppData/Local/my-agent/agent.sock
+ssh-add -l
+```
+
+`file-agent` serves one in `%LOCALAPPDATA%\file-agent`. Alternatively,
+point Git at Windows' OpenSSH, which uses the pipe:
 
 ```powershell
 git config --global core.sshCommand C:/Windows/System32/OpenSSH/ssh.exe

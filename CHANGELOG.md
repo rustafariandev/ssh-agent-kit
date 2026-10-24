@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Cygwin-style sockets on Windows, for the `ssh`, `ssh-add` and
+  `ssh-keygen` that Git for Windows, MSYS2 and Cygwin bundle, which cannot
+  open a named pipe. `bind_cygwin_socket` writes the socket file their
+  runtime looks for. The file names a loopback port and a secret, and only
+  the user and LocalSystem may read it. It returns a `CygwinListener` to
+  `serve`. Clients must know the secret and run as the user or
+  LocalSystem. `connect_cygwin` is the client side. The `file-agent`
+  example serves one.
+
 ## [1.1.0] - 2026-10-18
 
 ### Added
