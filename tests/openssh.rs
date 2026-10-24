@@ -1105,3 +1105,108 @@ fn matches_openssh_agent_listing_for_each_key_type() {
         ours.cmd("ssh-add").arg("-D").status().unwrap();
     }
 }
+
+/// The Cygwin-runtime OpenSSH tool `name`: Git for Windows' (from
+/// `$SSH_AGENT_KIT_CYGWIN_OPENSSH`, else where Git installs it), which
+/// reaches an agent only through a Cygwin-style socket.
+#[cfg(windows)]
+fn cygwin_tool(name: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os("SSH_AGENT_KIT_CYGWIN_OPENSSH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let root =
+                std::env::var_os("ProgramFiles").unwrap_or_else(|| r"C:\Program Files".into());
+            Path::new(&root).join(r"Git\usr\bin")
+        });
+    let exe = dir.join(format!("{name}.exe"));
+    if exe.exists() {
+        return Some(exe);
+    }
+    // CI must not pass by skipping.
+    if std::env::var_os("CI").is_some() {
+        panic!("{} not found", exe.display());
+    }
+    None
+}
+
+/// Git for Windows' `ssh-add` loads, lists and removes keys, and its
+/// `ssh-keygen -Y sign` signs, through a Cygwin-style socket. The socket is
+/// named as Git Bash takes it, with forward slashes.
+#[cfg(windows)]
+#[test]
+fn git_for_windows_tools_drive_the_agent_on_a_cygwin_socket() {
+    let (Some(ssh_add), Some(ssh_keygen)) = (cygwin_tool("ssh-add"), cygwin_tool("ssh-keygen"))
+    else {
+        eprintln!("Git for Windows' OpenSSH not installed; skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let (listener, guard) = ssh_agent_kit::bind_cygwin_socket(&socket).unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server = {
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || serve(listener, Arc::new(Agent::new()), shutdown))
+    };
+    let unix_path = |path: &Path| text(path).replace('\\', "/");
+    let run = |program: &Path, args: &[&str]| {
+        Command::new(program)
+            .args(args)
+            .env("SSH_AUTH_SOCK", unix_path(&socket))
+            .env_remove("SSH_AGENT_PID")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    let key = dir.path().join("cygwin-key");
+    let out = run(
+        &ssh_keygen,
+        &[
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "cygwin-key",
+            "-f",
+            &unix_path(&key),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let out = run(&ssh_add, &[&unix_path(&key)]);
+    assert!(out.status.success(), "{out:?}");
+    let out = run(&ssh_add, &["-l"]);
+    let listing = String::from_utf8(out.stdout).unwrap();
+    assert!(listing.contains("cygwin-key (ED25519)"), "{listing}");
+
+    // Only the public half on disk, so the signature must come from the agent.
+    std::fs::remove_file(&key).unwrap();
+    let message = dir.path().join("message");
+    std::fs::write(&message, b"hello").unwrap();
+    let public = format!("{}.pub", unix_path(&key));
+    let out = run(
+        &ssh_keygen,
+        &[
+            "-Y",
+            "sign",
+            "-n",
+            "file",
+            "-f",
+            &public,
+            &unix_path(&message),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(dir.path().join("message.sig").exists());
+
+    let out = run(&ssh_add, &["-D"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(!run(&ssh_add, &["-l"]).status.success());
+
+    shutdown.store(true, Ordering::SeqCst);
+    server.join().unwrap().unwrap();
+    drop(guard);
+    assert!(!socket.exists());
+}

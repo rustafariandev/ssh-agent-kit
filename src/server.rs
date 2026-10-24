@@ -245,18 +245,46 @@ pub enum SocketError {
 
 /// Removes the socket file when dropped. A named pipe has no file: it goes
 /// once its listener does.
-pub struct SocketGuard(pub(crate) PathBuf);
+pub struct SocketGuard {
+    pub(crate) path: PathBuf,
+    pub(crate) removal: Removal,
+}
+
+/// What a [`SocketGuard`] removes.
+pub(crate) enum Removal {
+    /// Nothing: a named pipe.
+    #[cfg(windows)]
+    Nothing,
+    /// The file: a unix socket.
+    #[cfg(unix)]
+    File,
+    /// The file while it holds these bytes: a Cygwin socket, which a newer
+    /// agent may have replaced with its own.
+    #[cfg(windows)]
+    FileHolding(Vec<u8>),
+}
 
 impl SocketGuard {
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        let _ = std::fs::remove_file(&self.0);
+        let remove = match &self.removal {
+            #[cfg(windows)]
+            Removal::Nothing => false,
+            #[cfg(unix)]
+            Removal::File => true,
+            #[cfg(windows)]
+            Removal::FileHolding(contents) => {
+                std::fs::read(&self.path).is_ok_and(|held| held == *contents)
+            }
+        };
+        if remove {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

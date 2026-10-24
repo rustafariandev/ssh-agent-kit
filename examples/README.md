@@ -28,7 +28,9 @@ ssh-add -s github
 ssh-add -L
 ```
 
-`file-agent` on Windows also answers PuTTY's tools, as Pageant would.
+`file-agent` on Windows also answers PuTTY's tools, as Pageant would, and
+Git Bash's `ssh` on a Cygwin-style socket. It prints the `SSH_AUTH_SOCK`
+for each.
 
 A quick session with one of them:
 

@@ -18,6 +18,14 @@
 //! ssh-add $HOME\.ssh\id_ed25519
 //! ssh-add -l
 //! ```
+//!
+//! Git Bash's own `ssh` cannot open the pipe, so the agent also serves a
+//! Cygwin-style socket for it, and prints its path:
+//!
+//! ```sh
+//! export SSH_AUTH_SOCK=C:/Users/me/AppData/Local/file-agent/agent.sock
+//! ssh-add -l
+//! ```
 
 use ssh_agent_kit::{
     Agent, Confirm, ConfirmRequest, Policy, SignInfo, bind_socket, default_socket_path, serve,
@@ -69,11 +77,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         eprintln!("$env:SSH_AUTH_SOCK = '{}'", path.display());
         serve_as_pageant(&agent, &shutdown);
+        serve_cygwin(&agent, &shutdown);
     }
     #[cfg(unix)]
     eprintln!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK", path.display());
     serve(listener, agent, shutdown)?;
     Ok(())
+}
+
+/// Answer the `ssh` that Git for Windows, MSYS2 and Cygwin bundle too, on a
+/// Cygwin-style socket in `%LOCALAPPDATA%\file-agent`.
+#[cfg(windows)]
+fn serve_cygwin(agent: &Arc<Agent>, shutdown: &Arc<AtomicBool>) {
+    use ssh_agent_kit::{bind_cygwin_socket, server::runtime_dir};
+
+    let path = runtime_dir("file-agent").join("agent.sock");
+    match bind_cygwin_socket(&path) {
+        Ok((listener, guard)) => {
+            // Git Bash takes the path with forward slashes.
+            let unix_path = path.to_string_lossy().replace('\\', "/");
+            eprintln!("export SSH_AUTH_SOCK='{unix_path}'   # in Git Bash");
+            let (agent, shutdown) = (Arc::clone(agent), Arc::clone(shutdown));
+            std::thread::spawn(move || {
+                let _guard = guard;
+                if let Err(e) = serve(listener, agent, shutdown) {
+                    eprintln!("Cygwin socket: {e}");
+                }
+            });
+        }
+        Err(e) => eprintln!("not serving a Cygwin socket: {e}"),
+    }
 }
 
 /// Answer PuTTY's tools too, on threads of their own: newer ones on

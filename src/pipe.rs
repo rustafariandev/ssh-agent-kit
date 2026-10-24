@@ -6,7 +6,7 @@
 //! The Win32 calls are all in here and in `pageant`; each `unsafe` block
 //! says why it is sound.
 
-use crate::server::{Listener, SocketError, SocketGuard, Stream};
+use crate::server::{Listener, Removal, SocketError, SocketGuard, Stream};
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
@@ -189,7 +189,7 @@ pub(crate) fn current_user() -> io::Result<Sid> {
 }
 
 /// The user process `pid` runs as.
-fn user_of_process(pid: u32) -> io::Result<Sid> {
+pub(crate) fn user_of_process(pid: u32) -> io::Result<Sid> {
     // SAFETY: the result is checked.
     let process =
         Handle::checked(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
@@ -325,7 +325,11 @@ pub fn bind_socket(path: &Path) -> Result<(SocketListener, SocketGuard), SocketE
         stop,
         thread: Some(thread),
     };
-    Ok((listener, SocketGuard(path.to_owned())))
+    let guard = SocketGuard {
+        path: path.to_owned(),
+        removal: Removal::Nothing,
+    };
+    Ok((listener, guard))
 }
 
 /// Accepts connections on a named pipe made by [`bind_socket`].
@@ -581,7 +585,7 @@ impl PipeStream {
 }
 
 /// The user at the other end of a [`PipeStream`].
-pub struct PeerUser(Sid);
+pub struct PeerUser(pub(crate) Sid);
 
 impl PeerUser {
     /// Whether it is this user or LocalSystem: the same rule as "this uid

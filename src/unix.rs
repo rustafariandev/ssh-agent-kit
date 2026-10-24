@@ -1,7 +1,7 @@
 //! The unix transport: an owner-only unix socket in a private directory,
 //! with the peer's uid checked.
 
-use crate::server::{Listener, SocketError, SocketGuard, Stream};
+use crate::server::{Listener, Removal, SocketError, SocketGuard, Stream};
 use nix::sys::stat::{Mode, umask};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
@@ -108,7 +108,10 @@ pub fn bind_socket(path: &Path) -> Result<(SocketListener, SocketGuard), SocketE
         umask(previous);
         bound.map_err(bind_error)?
     };
-    let guard = SocketGuard(path.to_owned());
+    let guard = SocketGuard {
+        path: path.to_owned(),
+        removal: Removal::File,
+    };
     // Other code in the process may change the umask without the lock, so
     // set the mode outright too. On failure the guard removes the socket.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(bind_error)?;

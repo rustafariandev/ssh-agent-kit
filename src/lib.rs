@@ -24,7 +24,9 @@
 //! pipe (`\\.\pipe\NAME`) that Win32-OpenSSH reaches through
 //! `SSH_AUTH_SOCK`. On Windows the crate also answers PuTTY's tools as
 //! Pageant would: serve the pipe `pageant_pipe_name()` names, and open
-//! Pageant's window with `serve_pageant_window`.
+//! Pageant's window with `serve_pageant_window`. The `ssh` that Git for
+//! Windows, MSYS2 and Cygwin bundle reaches neither, but connects to the
+//! Cygwin-style socket file `bind_cygwin_socket` makes.
 //!
 //! ```no_run
 //! use ssh_agent_kit::{Agent, bind_socket, default_socket_path, serve};
@@ -46,6 +48,8 @@ pub mod agent;
 pub mod backend;
 pub mod cert;
 pub mod client;
+#[cfg(windows)]
+mod cygwin;
 pub mod destination;
 pub mod extension;
 pub mod keytype;
@@ -70,6 +74,8 @@ pub use agent::{Agent, AgentError};
 pub use backend::{Backend, Expiring, Lifecycle, Removed, SmartcardProvider};
 pub use cert::{AssociatedCerts, CertError, CertKey};
 pub use client::{ClientStream, connect};
+#[cfg(windows)]
+pub use cygwin::{CygwinListener, CygwinStream, bind_cygwin_socket, connect_cygwin};
 pub use destination::{
     BindError, Connection, ConstraintError, ConstraintHop, DestinationConstraint, HostKeySpec,
     SessionBinding, Userauth,
